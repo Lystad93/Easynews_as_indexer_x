@@ -1,6 +1,7 @@
 import base64
 import html
 import os
+import random
 import re
 import threading
 import time
@@ -20,6 +21,28 @@ _CLIENT: Optional[EasynewsClient] = None
 _CLIENT_LOCK = threading.Lock()
 _CLIENT_LOGIN_TTL = 600  # seconds
 _CLIENT_LAST_LOGIN: float = 0.0
+
+
+def _retry_request(
+    fn,
+    max_retries=3,
+    base_delay=1.0,
+    max_delay=15.0,
+):
+    """Exponential backoff + jitter for transient HTTP failures."""
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except (requests.exceptions.RequestException, EasynewsError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                delay = min(
+                    base_delay * (2 ** attempt) + random.uniform(0, base_delay),
+                    max_delay,
+                )
+                time.sleep(delay)
+    raise last_exc  # type: ignore[arg-type]
 
 
 def _load_dotenv():
@@ -552,16 +575,16 @@ def filter_and_map(
 
         if isinstance(it, list):
             if len(it) >= 12:
-                hash_id = it[0]
-                subject = it[6]
-                filename_no_ext = it[10]
-                ext = it[11]
+                hash_id = it
+                subject = it
+                filename_no_ext = it
+                ext = it
             if len(it) > 7:
-                poster = it[7]
+                poster = it
             if len(it) > 8:
-                posted_raw = it[8]
+                posted_raw = it
             if len(it) > 14:
-                duration_raw = it[14]
+                duration_raw = it
         elif isinstance(it, dict):
             hash_id = it.get("hash") or it.get("0") or it.get("id")
             subject = it.get("subject") or it.get("6")
@@ -840,13 +863,17 @@ def api():
                 ]
         else:
             c = client()
-            # aim for maximum results per page
-            data = c.search(
-                query=q,
-                file_type="VIDEO",
-                per_page=250,
-                sort_field="relevance",
-                sort_dir="-",
+            # aim for maximum results per page (retry built into client.search)
+            data = _retry_request(
+                lambda: c.search(
+                    query=q,
+                    file_type="VIDEO",
+                    per_page=250,
+                    sort_field="relevance",
+                    sort_dir="-",
+                ),
+                max_retries=3,
+                base_delay=2.0,
             )
             if fallback_query:
                 items = filter_and_map(data, min_bytes=min_bytes)
@@ -977,9 +1004,12 @@ def api():
         try:
             c = client()
             payload = c.build_nzb_payload([si], name=d.get("title"))
-            # fetch content
             url = "https://members.easynews.com/2.0/api/dl-nzb"
-            r = c.s.post(url, data=payload, timeout=60)
+            r = _retry_request(
+                lambda: c.s.post(url, data=payload, timeout=60),
+                max_retries=3,
+                base_delay=2.0,
+            )
         except EasynewsError as e:
             return Response(f"Upstream error: {e}", status=502)
         except requests.exceptions.RequestException as e:
@@ -1004,3 +1034,4 @@ def api():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8081))
     APP.run(host="0.0.0.0", port=port)
+    
