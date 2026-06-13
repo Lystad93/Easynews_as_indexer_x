@@ -1,5 +1,6 @@
 import base64
 import html
+import logging
 import os
 import random
 import re
@@ -16,10 +17,25 @@ import json
 from easynews_client import EasynewsClient, EasynewsError, SearchItem
 
 
+# ---------------------------------------------------------------------------
+# Logging setup — plain, human-readable output for Docker logs
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+# Suppress noisy library logs
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
 APP = Flask(__name__)
 _CLIENT: Optional[EasynewsClient] = None
 _CLIENT_LOCK = threading.Lock()
-_CLIENT_LOGIN_TTL = 600  # seconds
+_CLIENT_LOGIN_TTL = 600  # seconds between session refreshes
 _CLIENT_LAST_LOGIN: float = 0.0
 
 
@@ -83,16 +99,35 @@ def client() -> EasynewsClient:
     with _CLIENT_LOCK:
         now = time.time()
         if _CLIENT is None:
+            # First-time startup — must succeed
+            logger.info("Starting up: logging in to Easynews for the first time...")
             _CLIENT = EasynewsClient(EZ_USER, EZ_PASS)
             _CLIENT.login()
             _CLIENT_LAST_LOGIN = now
+            logger.info("Startup login succeeded. Indexer is ready.")
         elif now - _CLIENT_LAST_LOGIN > _CLIENT_LOGIN_TTL:
+            # Periodic session refresh.
+            # IMPORTANT: failure here is NOT fatal — the session uses HTTP Basic Auth
+            # so searches will likely still work even if the refresh fails.
+            age_mins = int((now - _CLIENT_LAST_LOGIN) / 60)
+            logger.info(
+                "Session is %d min old (TTL=%ds). Refreshing login...",
+                age_mins, _CLIENT_LOGIN_TTL,
+            )
             try:
                 _CLIENT.login()
-            except EasynewsError:
-                _CLIENT = EasynewsClient(EZ_USER, EZ_PASS)
-                _CLIENT.login()
-            _CLIENT_LAST_LOGIN = time.time()
+                _CLIENT_LAST_LOGIN = time.time()
+                logger.info("Session refresh succeeded.")
+            except EasynewsError as e:
+                # Back off by half the TTL so we retry sooner than normal,
+                # but keep the existing client — don't return a 500.
+                _CLIENT_LAST_LOGIN = now - (_CLIENT_LOGIN_TTL // 2)
+                logger.warning(
+                    "Session refresh failed: %s. "
+                    "Keeping existing session — searches should still work. "
+                    "Will retry login in ~%ds.",
+                    e, _CLIENT_LOGIN_TTL // 2,
+                )
         return _CLIENT
 
 
@@ -107,7 +142,6 @@ def xml_escape(s: str) -> str:
 
 
 def encode_id(item: dict) -> str:
-    # Pack info needed to build NZB for a single selection and preserve title for filename
     payload = {
         "hash": item.get("hash"),
         "filename": item.get("filename"),
@@ -191,29 +225,11 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
 
 
 _ALLOWED_VIDEO_EXTENSIONS = {
-    ".mkv",
-    ".mp4",
-    ".m4v",
-    ".avi",
-    ".ts",
-    ".mov",
-    ".wmv",
-    ".mpg",
-    ".mpeg",
-    ".flv",
-    ".webm",
+    ".mkv", ".mp4", ".m4v", ".avi", ".ts", ".mov",
+    ".wmv", ".mpg", ".mpeg", ".flv", ".webm",
 }
 
-_STOPWORDS = {
-    "the",
-    "a",
-    "an",
-    "and",
-    "of",
-    "in",
-    "for",
-    "on",
-}
+_STOPWORDS = {"the", "a", "an", "and", "of", "in", "for", "on"}
 
 _MIN_DURATION_SECONDS = 60
 _TOKEN_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
@@ -223,52 +239,26 @@ _SEASON_EP_RE = re.compile(
     r"(?:s(?P<season>\d{1,2})e(?P<episode>\d{1,2})|(?<!\d)(?P<season2>\d{1,2})x(?P<episode2>\d{1,2})(?!\d))",
     re.IGNORECASE,
 )
-# Anime detection patterns
 _ANIME_BRACKET_GROUP_RE = re.compile(r"^\[([^\]]+)\]", re.IGNORECASE)
 
-# Known fansub groups for anime detection
 _KNOWN_FANSUB_GROUPS = {
-    "subsplease",
-    "erai-raws",
-    "horriblesubs",
-    "judas",
-    "gjm",
-    "commiesubs",
-    "commie",
-    "animekaizoku",
-    "anime time",
-    "asenshi",
-    "damedesuyo",
-    "gg",
-    "fff",
-    "underwater",
-    "ember",
-    "kametsu",
-    "kawaiika",
-    "mezashite",
-    "reinforce",
-    "senritsu",
-    "vivid",
-    "coalgirls",
-    "utw",
-    "thora",
-    "ohys-raws",
-    "leopard-raws",
-    "asw",
-    "mtbb",
-    "anime-time",
+    "subsplease", "erai-raws", "horriblesubs", "judas", "gjm",
+    "commiesubs", "commie", "animekaizoku", "anime time", "asenshi",
+    "damedesuyo", "gg", "fff", "underwater", "ember", "kametsu",
+    "kawaiika", "mezashite", "reinforce", "senritsu", "vivid",
+    "coalgirls", "utw", "thora", "ohys-raws", "leopard-raws",
+    "asw", "mtbb", "anime-time",
 }
 _SANITIZE_SYMBOLS_RE = re.compile(r"[\.\-_:\s]+")
 _NON_ALNUM_RE = re.compile(r"[^\w\sÀ-ÿ]")
 
-# Newznab category constants
 CATEGORY_MOVIES = 2000
 CATEGORY_MOVIES_HD = 2030
 CATEGORY_MOVIES_UHD = 2040
 CATEGORY_TV = 5000
 CATEGORY_TV_HD = 5030
 CATEGORY_TV_UHD = 5040
-CATEGORY_ANIME = 5070  # Anime as TV subcategory
+CATEGORY_ANIME = 5070
 CATEGORY_OTHER = 7000
 
 
@@ -421,70 +411,29 @@ def _extract_release_markers(
 
 
 def _detect_anime(title: str) -> bool:
-    """
-    Detect anime releases using fansub indicators.
-
-    Requirements (all must be true):
-    1. Bracketed release group at start: [Group]
-    2. Group must be in known fansub whitelist
-    3. Episode-only numbering (- 01, Ep 01, Episode 01)
-    4. NO traditional TV patterns (S01E01, 1x02)
-
-    Returns: True if anime, False otherwise
-    """
-    # Guard: Exclude if traditional TV patterns exist
     if _SEASON_EP_RE.search(title):
         return False
-
     bracket_match = _ANIME_BRACKET_GROUP_RE.search(title)
     if not bracket_match:
         return False
-
-    # This prevents [BBC], [PBS], [REPACK] from being detected as anime
     group_name = bracket_match.group(1).strip().lower()
     if group_name not in _KNOWN_FANSUB_GROUPS:
         return False
-
-    # Remove bracketed group to avoid false matches
-    title_without_group = title[bracket_match.end() :].strip()
-
-    # Episode patterns: "- 01", "Ep 01", "Episode 01", "- 01v2", "-1090."
-    # Support up to 4 digits for long-running anime (e.g., One Piece episode 1045)
+    title_without_group = title[bracket_match.end():].strip()
     episode_patterns = [
-        r"[\s\-_]+\d{1,4}(?:\s*v\d+)?[\s\-_\.\(\[]",  # " - 1090 " or "-1045." or "- 01v2 -"
-        r"[\s\-_]Ep?\.?\s*\d{1,4}",  # "- Ep01" or " E1045"
-        r"[\s\-_]Episode\s*\d{1,4}",  # "- Episode 01" or "- Episode 1045"
+        r"[\s\-_]+\d{1,4}(?:\s*v\d+)?[\s\-_\.\(\[]",
+        r"[\s\-_]Ep?\.?\s*\d{1,4}",
+        r"[\s\-_]Episode\s*\d{1,4}",
     ]
-
-    has_episode = any(
+    return any(
         re.search(pattern, title_without_group, re.IGNORECASE)
         for pattern in episode_patterns
     )
 
-    return has_episode
-
 
 def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
-    """
-    Detect Newznab category based on filename and extracted metadata.
-
-    Detection logic:
-    1. Anime: bracketed fansub groups + episode-only patterns (PRIORITY)
-    2. TV shows: presence of season/episode patterns (SxxExx or xxyy)
-    3. Movies: presence of year, absence of TV patterns
-    4. Resolution subcategories: 720p+ = HD, 2160p/4K/UHD = UHD (TV/Movies only)
-    5. Default to generic categories if uncertain
-
-    Args:
-        title: The filename/title to analyze
-        metadata: Dict with season, episode, year, quality keys
-
-    Returns:
-        Newznab category ID (int)
-    """
-    # Check for anime FIRST (priority detection)
     if _detect_anime(title):
-        return CATEGORY_ANIME  # 5070 - No quality subcategories
+        return CATEGORY_ANIME
 
     season = metadata.get("season")
     episode = metadata.get("episode")
@@ -496,38 +445,33 @@ def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
     is_hd = False
 
     if quality_lower:
-        # UHD: 2160p or higher, or contains 4k/uhd keywords
         if "2160" in quality_lower or "4k" in quality_lower or "uhd" in quality_lower:
             is_uhd = True
-        # HD: 720p or 1080p
         elif "720" in quality_lower or "1080" in quality_lower:
             is_hd = True
 
     has_tv_pattern = season is not None or episode is not None
-
     if not has_tv_pattern:
         if _SEASON_EP_RE.search(title):
             has_tv_pattern = True
 
     if has_tv_pattern:
         if is_uhd:
-            return CATEGORY_TV_UHD  # 5040
+            return CATEGORY_TV_UHD
         elif is_hd:
-            return CATEGORY_TV_HD  # 5030
+            return CATEGORY_TV_HD
         else:
-            return CATEGORY_TV  # 5000
+            return CATEGORY_TV
 
-    # Movies typically have a year but no season/episode
     if year or (not has_tv_pattern):
         if is_uhd:
-            return CATEGORY_MOVIES_UHD  # 2040
+            return CATEGORY_MOVIES_UHD
         elif is_hd:
-            return CATEGORY_MOVIES_HD  # 2030
+            return CATEGORY_MOVIES_HD
         else:
-            return CATEGORY_MOVIES  # 2000
+            return CATEGORY_MOVIES
 
-    # Default fallback to generic Movies
-    return CATEGORY_MOVIES  # 2000
+    return CATEGORY_MOVIES
 
 
 def _matches_strict(title: str, strict_phrase: Optional[str]) -> bool:
@@ -575,16 +519,16 @@ def filter_and_map(
 
         if isinstance(it, list):
             if len(it) >= 12:
-                hash_id = it
-                subject = it
-                filename_no_ext = it
-                ext = it
+                hash_id = it[0]
+                subject = it[6]
+                filename_no_ext = it[10]
+                ext = it[11]
             if len(it) > 7:
-                poster = it
+                poster = it[7]
             if len(it) > 8:
-                posted_raw = it
+                posted_raw = it[8]
             if len(it) > 14:
-                duration_raw = it
+                duration_raw = it[14]
         elif isinstance(it, dict):
             hash_id = it.get("hash") or it.get("0") or it.get("id")
             subject = it.get("subject") or it.get("6")
@@ -607,7 +551,6 @@ def filter_and_map(
         if extension_field and not ext:
             ext = extension_field
 
-        # Try to use numeric size if present; otherwise skip (can't verify <100MB rule)
         if not isinstance(size, int):
             try:
                 size = int(size)
@@ -698,9 +641,12 @@ def filter_and_map(
 @APP.route("/api")
 def api():
     if not require_apikey():
+        logger.warning("Rejected request with wrong API key from %s", request.remote_addr)
         return Response("Unauthorized", status=401)
 
     t = request.args.get("t", "caps")
+    logger.info("Request: t=%s q=%r from %s", t, request.args.get("q", ""), request.remote_addr)
+
     if t == "caps":
         xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
@@ -762,23 +708,20 @@ def api():
         raw_query = search_label or base_query
         q = raw_query.strip()
         fallback_query = False
-        if (
-            not q or q.lower() == "test"
-        ):  # allow Prowlarr validation calls to receive data
-            # Check if TV/Anime categories are requested
+        if not q or q.lower() == "test":
             tv_categories = {"5000", "5030", "5040"}
             anime_categories = {"5070"}
             requested_categories = set(cat_param.split(",")) if cat_param else set()
             wants_tv = t == "tvsearch" or bool(requested_categories & tv_categories)
             wants_anime = bool(requested_categories & anime_categories)
-            # Use appropriate fallback query
             if wants_anime:
-                q = "one piece"  # Anime fallback
+                q = "one piece"
             elif wants_tv:
-                q = "breaking bad"  # TV fallback
+                q = "breaking bad"
             else:
-                q = "matrix"  # Movie fallback
+                q = "matrix"
             fallback_query = True
+
         query_tokens = _tokenize(raw_query)
         query_meta = _extract_release_markers(raw_query)
         if year_int:
@@ -790,12 +733,7 @@ def api():
         strict_param = request.args.get("strict")
         strict_requested = t in {"movie", "tvsearch"}
         if strict_param is not None:
-            strict_requested = strict_param.strip().lower() not in {
-                "0",
-                "false",
-                "no",
-                "off",
-            }
+            strict_requested = strict_param.strip().lower() not in {"0", "false", "no", "off"}
         strict_phrase = _sanitize_phrase(raw_query) if strict_requested else None
         limit = int(request.args.get("limit", "100"))
         offset = int(request.args.get("offset", "0"))
@@ -809,7 +747,6 @@ def api():
         min_bytes = min_size_mb * 1024 * 1024
 
         if fallback_query:
-            # Check if TV/Anime categories are requested
             tv_categories = {"5000", "5030", "5040"}
             anime_categories = {"5070"}
             requested_categories = set(cat_param.split(",")) if cat_param else set()
@@ -817,7 +754,6 @@ def api():
             wants_anime = bool(requested_categories & anime_categories)
 
             if wants_anime:
-                # Anime-appropriate fallback
                 items = [
                     {
                         "hash": "SAMPLEHASH_ANIME123",
@@ -832,7 +768,6 @@ def api():
                     }
                 ]
             elif wants_tv:
-                # TV-appropriate fallback for Sonarr
                 items = [
                     {
                         "hash": "SAMPLEHASH_TV123456",
@@ -847,7 +782,6 @@ def api():
                     }
                 ]
             else:
-                # Movie fallback for Radarr
                 items = [
                     {
                         "hash": "SAMPLEHASH1234567890",
@@ -863,7 +797,7 @@ def api():
                 ]
         else:
             c = client()
-            # aim for maximum results per page (retry built into client.search)
+            search_start = time.time()
             data = _retry_request(
                 lambda: c.search(
                     query=q,
@@ -875,19 +809,21 @@ def api():
                 max_retries=3,
                 base_delay=2.0,
             )
-            if fallback_query:
-                items = filter_and_map(data, min_bytes=min_bytes)
-            else:
-                items = filter_and_map(
-                    data,
-                    min_bytes=min_bytes,
-                    query_tokens=query_tokens,
-                    query_meta=query_meta,
-                    strict_phrase=strict_phrase,
-                    strict_match=strict_requested,
-                )
+            elapsed = time.time() - search_start
+            raw_count = len(data.get("data", []))
+            items = filter_and_map(
+                data,
+                min_bytes=min_bytes,
+                query_tokens=query_tokens,
+                query_meta=query_meta,
+                strict_phrase=strict_phrase,
+                strict_match=strict_requested,
+            )
+            logger.info(
+                "Search %r → %d raw results, %d passed filters, in %.1fs",
+                q, raw_count, len(items), elapsed,
+            )
 
-        # Trim by limit (handles fallback and real queries)
         items = items[offset : offset + limit]
 
         display_q = raw_query if raw_query else q
@@ -940,21 +876,13 @@ def api():
                 f'<newznab:attr name="posted" value="{posted_epoch}"/>',
             ]
             if poster:
-                attr_parts.append(
-                    f'<newznab:attr name="poster" value="{xml_escape(poster)}"/>'
-                )
+                attr_parts.append(f'<newznab:attr name="poster" value="{xml_escape(poster)}"/>')
             if quality:
-                attr_parts.append(
-                    f'<newznab:attr name="quality" value="{xml_escape(quality)}"/>'
-                )
+                attr_parts.append(f'<newznab:attr name="quality" value="{xml_escape(quality)}"/>')
             if duration_hms:
-                attr_parts.append(
-                    f'<newznab:attr name="duration" value="{duration_hms}"/>'
-                )
+                attr_parts.append(f'<newznab:attr name="duration" value="{duration_hms}"/>')
             if thumb:
-                attr_parts.append(
-                    f'<newznab:attr name="thumb" value="{xml_escape(thumb)}"/>'
-                )
+                attr_parts.append(f'<newznab:attr name="thumb" value="{xml_escape(thumb)}"/>')
             if year:
                 attr_parts.append(f'<newznab:attr name="year" value="{year}"/>')
             if season:
@@ -985,7 +913,6 @@ def api():
             return Response("Missing id", status=400)
         d = decode_id(enc_id)
         if d.get("sample"):
-            title = d.get("title", "Sample Item")
             safe_title = "sample"
             nzb_content = (
                 '<?xml version="1.0" encoding="UTF-8"?>'
@@ -996,9 +923,7 @@ def api():
                 "</file></nzb>"
             ).encode("utf-8")
             resp = Response(nzb_content, mimetype="application/x-nzb")
-            resp.headers["Content-Disposition"] = (
-                f'attachment; filename="{safe_title}.nzb"'
-            )
+            resp.headers["Content-Disposition"] = f'attachment; filename="{safe_title}.nzb"'
             return resp
         si = to_search_item(d)
         try:
@@ -1016,12 +941,9 @@ def api():
             return Response(f"Upstream network error: {e}", status=502)
         if r.status_code != 200:
             return Response(f"Upstream error {r.status_code}", status=502)
-        # Name file as title.nzb
         title = d.get("title") or (d.get("filename", "download") + d.get("ext", ""))
         safe_title = (
-            "".join(ch for ch in title if ch.isalnum() or ch in (" ", "-", "_", "."))[
-                :200
-            ].strip()
+            "".join(ch for ch in title if ch.isalnum() or ch in (" ", "-", "_", "."))[:200].strip()
             or "download"
         )
         resp = Response(r.content, mimetype="application/x-nzb")
@@ -1034,4 +956,3 @@ def api():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8081))
     APP.run(host="0.0.0.0", port=port)
-    

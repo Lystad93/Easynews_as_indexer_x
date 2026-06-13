@@ -1,7 +1,15 @@
 services:
-  easynews_as_indexer:
-    image: ghcr.io/sanket9225/easynews_as_indexer
-    environment:
-      PORT: "8081"
-    ports:
-      - "8081:8081"
+  easynews-indexer:
+    image: ghcr.io/lystad93/easynews_as_indexer_x:latest
+    container_name: easynews-indexer
+    restart: unless-stopped
+    labels:
+      - "dockhand.hidden=true"
+      - "dockhand.order=1"
+    expose:
+      - ${PORT}
+    env_file:
+      - .env
+    profiles:
+      - easynews-indexer
+      - all

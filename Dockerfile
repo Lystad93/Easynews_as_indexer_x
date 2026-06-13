@@ -13,4 +13,4 @@ COPY . .
 
 ENV PORT=8081
 
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 4 server:APP"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT} --workers 4 --timeout 90 server:APP"]

@@ -20,8 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import requests
-import urllib3
-from requests.exceptions import RequestException
+from requests.exceptions import ConnectionError, ReadTimeout, RequestException
 from urllib3.util.retry import Retry
 
 
@@ -33,8 +32,21 @@ _DOWNLOAD_TIMEOUT = 60
 
 logger = logging.getLogger(__name__)
 
-# Type variable for retry return type
 T = TypeVar("T")
+
+
+def _plain_error(e: Exception) -> str:
+    """Turn a requests exception into a short, non-technical description."""
+    if isinstance(e, ReadTimeout):
+        return f"Easynews did not respond within {_LOGIN_TIMEOUT} seconds (read timeout)"
+    if isinstance(e, ConnectionError):
+        msg = str(e)
+        if "RemoteDisconnected" in msg or "Connection aborted" in msg:
+            return "Easynews closed the connection without sending a response"
+        if "Failed to establish" in msg or "Connection refused" in msg:
+            return "Could not reach Easynews (connection refused or DNS failure)"
+        return f"Network connection error: {msg[:120]}"
+    return f"{type(e).__name__}: {str(e)[:120]}"
 
 
 class EasynewsError(Exception):
@@ -53,11 +65,6 @@ class SearchItem:
 
     @property
     def value_token(self) -> str:
-        """
-        Build the value string Easynews expects for checkbox selections:
-        format: "{hash}|{b64(filename)}:{b64(ext)}"
-        As seen in members.js createNZB -> it reads from input[checkbox].value
-        """
         fn_b64 = base64.b64encode(self.filename.encode()).decode().replace("=", "")
         ext_b64 = base64.b64encode(self.ext.encode()).decode().replace("=", "")
         return f"{self.hash}|{fn_b64}:{ext_b64}"
@@ -73,10 +80,7 @@ def _retry(
 ) -> T:
     """
     Call *fn* with exponential backoff + random jitter on transient failures.
-
-    - Retries on network errors (RequestException subclasses) and optionally
-      on specific HTTP status codes (5xx) via *on_retryable_response*.
-    - Delay = min(base_delay * 2^attempt + random(0..base_delay), max_delay)
+    Logs plain-English messages instead of raw exception tracebacks.
     """
     last_exc: Optional[Exception] = None
 
@@ -86,7 +90,7 @@ def _retry(
             if attempt > 0 and isinstance(result, requests.Response):
                 if on_retryable_response and on_retryable_response(result):
                     logger.info(
-                        "Retryable response %s on attempt %d, backing off",
+                        "Retryable HTTP %s on attempt %d, backing off",
                         result.status_code,
                         attempt,
                     )
@@ -97,23 +101,27 @@ def _retry(
         except retryable_exceptions as exc:
             last_exc = exc
             if attempt < max_retries:
-                delay = min(base_delay * (2 ** attempt) + random.uniform(0, base_delay), max_delay)
+                delay = min(
+                    base_delay * (2**attempt) + random.uniform(0, base_delay), max_delay
+                )
                 logger.warning(
-                    "Transient error on attempt %d/%d (%s), retrying in %.1fs",
+                    "Attempt %d/%d failed: %s. Retrying in %.1fs...",
                     attempt + 1,
                     max_retries + 1,
-                    exc,
+                    _plain_error(exc),
                     delay,
                 )
                 time.sleep(delay)
             else:
-                logger.error("Exhausted %d retries for %s", max_retries + 1, fn.__name__ if hasattr(fn, "__name__") else fn)
+                logger.error(
+                    "All %d attempts failed. Last error: %s",
+                    max_retries + 1,
+                    _plain_error(exc),
+                )
                 raise
         except EasynewsError:
-            # Non-transient domain errors — fail fast
             raise
 
-    # Should not reach here, but safety net
     if last_exc:
         raise last_exc
     return fn()  # type: ignore[unreachable]
@@ -126,20 +134,19 @@ class EasynewsClient:
         self.username = username
         self.password = password
         self.s = session or requests.Session()
-        # Default headers
         self.s.headers.update(
             {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EasynewsClient/1.0",
                 "Accept": "application/json, text/javascript, */*; q=0.9",
             }
         )
-        # Use HTTP Basic Auth for endpoints that support it
         self.s.auth = (self.username, self.password)
 
     def login(self) -> None:
         """
         Prime session and validate credentials using a quick authenticated call.
-        This relies on HTTP Basic Auth configured on the session.
+        Retries up to 3 times on transient network errors with exponential backoff.
+        Logs plain-English messages — no raw Python tracebacks.
         """
         def _do_login() -> requests.Response:
             self.s.get(f"{EASYNEWS_BASE}/2.0/", timeout=_LOGIN_TIMEOUT)
@@ -152,19 +159,23 @@ class EasynewsClient:
         def _is_retryable(r: requests.Response) -> bool:
             return 500 <= r.status_code < 600
 
+        logger.info("Logging in to Easynews...")
         try:
             resp = _retry(
                 _do_login,
                 max_retries=3,
-                base_delay=1.0,
+                base_delay=2.0,
                 on_retryable_response=_is_retryable,
             )
         except RequestException as e:
-            logger.exception("Network error during Easynews login")
-            raise EasynewsError(f"Network error during Easynews login: {e}") from e
+            reason = _plain_error(e)
+            logger.error("Login failed after all retries: %s", reason)
+            raise EasynewsError(f"Login failed: {reason}") from e
 
         if resp.status_code in (401, 403):
-            raise EasynewsError("Unauthorized; check username/password")
+            raise EasynewsError("Unauthorized — check EASYNEWS_USER and EASYNEWS_PASS")
+
+        logger.info("Login succeeded.")
 
     def search(
         self,
@@ -181,11 +192,7 @@ class EasynewsClient:
         """
         Call the same Solr-backed endpoint used by the site.
         Returns the raw JSON dict, including data and pagination fields.
-
-        Retry logic:
-        - Retries on transient network errors (5xx, timeouts).
-        - When *stale_retry* is True, re-fetches up to *max_retries* times
-          if the result set is empty (possible with cached/stale indexes).
+        Retries on transient errors and re-fetches if results are unexpectedly empty.
         """
         if file_type != "VIDEO":
             file_type = "VIDEO"
@@ -202,8 +209,7 @@ class EasynewsClient:
             "gps": query,
             "vv": "1",
             "safeO": str(safe_off),
-            # Cache-busting nonce to avoid serving stale cached results
-            "_nonce": str(random.random()),
+            "_nonce": str(random.random()),  # cache-busting
         }
         if sort_field:
             params["s1"] = sort_field
@@ -234,20 +240,17 @@ class EasynewsClient:
                     on_retryable_response=_is_retryable,
                 )
             except RequestException as e:
-                logger.exception("Search request failed for query '%s'", query)
-                raise EasynewsError(f"Search request failed: {e}") from e
+                reason = _plain_error(e)
+                logger.error("Search failed for query '%s': %s", query, reason)
+                raise EasynewsError(f"Search request failed: {reason}") from e
 
-            # Stale result detection: if data array is empty and we're allowed to retry
             is_empty = not data.get("data")
             if is_empty and stale_retry and attempt < max_retries:
-                delay = min(1.0 * (2 ** attempt) + random.uniform(0, 1.0), 15.0)
+                delay = min(1.0 * (2**attempt) + random.uniform(0, 1.0), 15.0)
                 logger.info(
                     "Empty results on attempt %d for '%s', re-fetching in %.1fs",
-                    attempt + 1,
-                    query,
-                    delay,
+                    attempt + 1, query, delay,
                 )
-                # Regenerate nonce for the next attempt
                 params["_nonce"] = str(random.random())
                 query_params = (
                     "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
@@ -275,9 +278,9 @@ class EasynewsClient:
 
             if isinstance(it, list):
                 if len(it) >= 12:
-                    hash_id = it
-                    filename_no_ext = it
-                    ext = it
+                    hash_id = it[0]
+                    filename_no_ext = it[10]
+                    ext = it[11]
             elif isinstance(it, dict):
                 if "0" in it:
                     hash_id = it.get("0", "")
@@ -310,12 +313,6 @@ class EasynewsClient:
         items: List[SearchItem],
         name: Optional[str] = None,
     ) -> Dict[str, str]:
-        """
-        Build the form-encoded payload expected by /2.0/api/dl-nzb.
-        Emulates createNZB() from members.js which submits hidden inputs of the checked items.
-        Keys look like "{index}&sig={sig}" and value is value_token.
-        We'll just use sequential indexes starting at 0.
-        """
         data: Dict[str, str] = {"autoNZB": "1"}
         for idx, it in enumerate(items):
             key = str(idx)
@@ -343,15 +340,12 @@ class EasynewsClient:
                 on_retryable_response=_is_retryable,
             )
         except RequestException as e:
-            logger.exception("NZB download request failed")
-            raise EasynewsError(f"NZB download request failed: {e}") from e
+            reason = _plain_error(e)
+            logger.error("NZB download failed: %s", reason)
+            raise EasynewsError(f"NZB download request failed: {reason}") from e
 
         if r.status_code != 200:
             raise EasynewsError(f"NZB creation failed: HTTP {r.status_code}")
-
-        content_type = r.headers.get("Content-Type", "")
-        if "xml" not in content_type and "nzb" not in content_type:
-            pass
 
         content = r.content.replace(b'date=""', b'date="0"')
         os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
