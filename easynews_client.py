@@ -14,7 +14,9 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import queue
 import random
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, TypeVar
@@ -30,6 +32,17 @@ _LOGIN_TIMEOUT = 15
 _SEARCH_TIMEOUT = 30
 _DOWNLOAD_TIMEOUT = 60
 
+# Latency-bounded search tuning (overridable via env). Defaults keep the whole
+# response comfortably under NZBHydra's 4s indexer timeout while hedging away a
+# slow/hung Easynews response so we don't hand back a spurious "0 results".
+#   budget        – hard wall-clock cap for the whole search call
+#   hedge_after   – if the in-flight request is slower than this, fire a fresh
+#                   parallel one and take whichever returns real data first
+#   attempt_timeout – per-request read timeout (kills a hung socket fast)
+_SEARCH_BUDGET = float(os.environ.get("SEARCH_BUDGET_SECONDS", "3.3"))
+_SEARCH_HEDGE_AFTER = float(os.environ.get("SEARCH_HEDGE_AFTER_SECONDS", "1.2"))
+_SEARCH_ATTEMPT_TIMEOUT = float(os.environ.get("SEARCH_ATTEMPT_TIMEOUT_SECONDS", "2.5"))
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -38,7 +51,7 @@ T = TypeVar("T")
 def _plain_error(e: Exception) -> str:
     """Turn a requests exception into a short, non-technical description."""
     if isinstance(e, ReadTimeout):
-        return f"Easynews did not respond within {_LOGIN_TIMEOUT} seconds (read timeout)"
+        return "Easynews did not respond in time (read timeout)"
     if isinstance(e, ConnectionError):
         msg = str(e)
         if "RemoteDisconnected" in msg or "Connection aborted" in msg:
@@ -177,6 +190,63 @@ class EasynewsClient:
 
         logger.info("Login succeeded.")
 
+    def _build_search_url(
+        self,
+        query: str,
+        file_type: str = "VIDEO",
+        page: int = 1,
+        per_page: int = 50,
+        sort_field: Optional[str] = "dtime",
+        sort_dir: str = "-",
+        safe_off: int = 0,
+        nonce: Optional[float] = None,
+    ) -> str:
+        if file_type != "VIDEO":
+            file_type = "VIDEO"
+        params = {
+            "fly": "2",
+            "sb": "1",
+            "pno": str(page),
+            "pby": str(per_page),
+            "u": "1",
+            "chxu": "1",
+            "chxgx": "1",
+            "st": "basic",
+            "gps": query,
+            "vv": "1",
+            "safeO": str(safe_off),
+            "_nonce": str(nonce if nonce is not None else random.random()),  # cache-busting
+        }
+        if sort_field:
+            params["s1"] = sort_field
+            params["s1d"] = sort_dir
+        url = f"{EASYNEWS_BASE}/2.0/search/solr-search/"
+        query_params = (
+            "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
+            + f"&fty%5B%5D={requests.utils.quote(file_type)}"
+        )
+        return f"{url}?{query_params}"
+
+    def _search_once(
+        self,
+        query: str,
+        file_type: str = "VIDEO",
+        page: int = 1,
+        per_page: int = 50,
+        sort_field: Optional[str] = "dtime",
+        sort_dir: str = "-",
+        safe_off: int = 0,
+        timeout: float = _SEARCH_TIMEOUT,
+        nonce: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """One search request with an explicit (short) timeout. No retries."""
+        full_url = self._build_search_url(
+            query, file_type, page, per_page, sort_field, sort_dir, safe_off, nonce
+        )
+        r = self.s.get(full_url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
     def search(
         self,
         query: str,
@@ -194,50 +264,15 @@ class EasynewsClient:
         Returns the raw JSON dict, including data and pagination fields.
         Retries on transient errors and re-fetches if results are unexpectedly empty.
         """
-        if file_type != "VIDEO":
-            file_type = "VIDEO"
-
-        params = {
-            "fly": "2",
-            "sb": "1",
-            "pno": str(page),
-            "pby": str(per_page),
-            "u": "1",
-            "chxu": "1",
-            "chxgx": "1",
-            "st": "basic",
-            "gps": query,
-            "vv": "1",
-            "safeO": str(safe_off),
-            "_nonce": str(random.random()),  # cache-busting
-        }
-        if sort_field:
-            params["s1"] = sort_field
-            params["s1d"] = sort_dir
-
-        url = f"{EASYNEWS_BASE}/2.0/search/solr-search/"
-        query_params = (
-            "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
-            + f"&fty%5B%5D={requests.utils.quote(file_type)}"
-        )
-        full_url = f"{url}?{query_params}"
-
-        def _is_retryable(r: requests.Response) -> bool:
-            return 500 <= r.status_code < 600
-
-        def _do_search() -> Dict[str, Any]:
-            r = self.s.get(full_url, timeout=_SEARCH_TIMEOUT)
-            r.raise_for_status()
-            return r.json()
-
         last_data: Optional[Dict[str, Any]] = None
         for attempt in range(max_retries + 1):
             try:
                 data = _retry(
-                    _do_search,
+                    lambda: self._search_once(
+                        query, file_type, page, per_page, sort_field, sort_dir, safe_off
+                    ),
                     max_retries=2,
                     base_delay=1.0,
-                    on_retryable_response=_is_retryable,
                 )
             except RequestException as e:
                 reason = _plain_error(e)
@@ -251,12 +286,6 @@ class EasynewsClient:
                     "Empty results on attempt %d for '%s', re-fetching in %.1fs",
                     attempt + 1, query, delay,
                 )
-                params["_nonce"] = str(random.random())
-                query_params = (
-                    "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
-                    + f"&fty%5B%5D={requests.utils.quote(file_type)}"
-                )
-                full_url = f"{url}?{query_params}"
                 time.sleep(delay)
                 continue
 
@@ -264,6 +293,89 @@ class EasynewsClient:
             break
 
         return last_data if last_data is not None else {}
+
+    def search_hedged(
+        self,
+        query: str,
+        file_type: str = "VIDEO",
+        page: int = 1,
+        per_page: int = 250,
+        sort_field: Optional[str] = "relevance",
+        sort_dir: str = "-",
+        safe_off: int = 0,
+        budget: float = _SEARCH_BUDGET,
+        hedge_after: float = _SEARCH_HEDGE_AFTER,
+        attempt_timeout: float = _SEARCH_ATTEMPT_TIMEOUT,
+        max_attempts: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Latency-bounded search that avoids timeout-induced empty results.
+
+        Fires a search; if Easynews hasn't answered within ``hedge_after`` seconds,
+        fires a fresh parallel ("hedged") request and returns whichever delivers
+        real data first. Every attempt uses a short read timeout, and the whole
+        call is capped at ``budget`` seconds — so one slow or hung Easynews
+        response can neither blow the downstream (NZBHydra) timeout nor produce a
+        spurious "0 results". If every attempt is empty/slow within the budget,
+        the best available payload is returned (genuinely-empty results can't be
+        invented, but a transiently slow Easynews no longer reads as zero).
+        """
+        deadline = time.monotonic() + budget
+        results: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        started = 0
+        last_empty: Optional[Dict[str, Any]] = None
+
+        def _launch() -> None:
+            nonlocal started
+            started += 1
+            idx = started
+
+            def _run() -> None:
+                try:
+                    data = self._search_once(
+                        query, file_type, page, per_page, sort_field, sort_dir,
+                        safe_off, timeout=attempt_timeout, nonce=random.random(),
+                    )
+                    results.put(("ok", data))
+                except Exception as exc:  # noqa: BLE001 - reported back to the loop
+                    results.put(("err", exc))
+
+            threading.Thread(target=_run, name=f"ez-search-{idx}", daemon=True).start()
+
+        start = time.monotonic()
+        _launch()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Wait for a result, but not past the hedge window while we still have
+            # attempts left to fire — that's what lets a fresh request overtake a
+            # slow one.
+            wait = remaining if started >= max_attempts else min(remaining, hedge_after)
+            try:
+                kind, payload = results.get(timeout=max(wait, 0.01))
+            except queue.Empty:
+                if started < max_attempts:
+                    _launch()  # in-flight attempt is dragging → hedge
+                continue
+
+            if kind == "ok" and payload.get("data"):
+                if started > 1:
+                    logger.info(
+                        "Search %r: hedged attempt won in %.1fs (%d attempts)",
+                        query, time.monotonic() - start, started,
+                    )
+                return payload
+            if kind == "ok":
+                last_empty = payload  # spurious empty — remember, but keep trying
+            if started < max_attempts:
+                _launch()  # error or empty → try a fresh request within budget
+
+        logger.warning(
+            "Search %r hit the %.1fs budget after %d attempt(s); returning best effort.",
+            query, budget, started,
+        )
+        return last_empty if last_empty is not None else {"data": []}
 
     @staticmethod
     def _collect_items(json_data: Dict[str, Any]) -> List[SearchItem]:

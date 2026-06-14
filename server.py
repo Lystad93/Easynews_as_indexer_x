@@ -35,8 +35,9 @@ logger = logging.getLogger(__name__)
 APP = Flask(__name__)
 _CLIENT: Optional[EasynewsClient] = None
 _CLIENT_LOCK = threading.Lock()
-_CLIENT_LOGIN_TTL = 600  # seconds between session refreshes
+_CLIENT_LOGIN_TTL = 1800  # seconds between session refreshes
 _CLIENT_LAST_LOGIN: float = 0.0
+_CLIENT_REFRESHING = False  # guard so only one background refresh runs at a time
 
 
 def _retry_request(
@@ -92,43 +93,87 @@ def require_apikey() -> bool:
     return (API_KEY is None) or (key == API_KEY)
 
 
+def _refresh_login_async() -> None:
+    """
+    Re-login in the background so a search is never blocked on a (sometimes slow
+    or flaky) Easynews login. HTTP Basic Auth stays on the session, so searches
+    keep working with the existing session while this runs.
+    """
+    global _CLIENT_LAST_LOGIN, _CLIENT_REFRESHING
+    try:
+        _CLIENT.login()  # type: ignore[union-attr]
+        with _CLIENT_LOCK:
+            _CLIENT_LAST_LOGIN = time.time()
+        logger.info("Background session refresh succeeded.")
+    except EasynewsError as e:
+        # Retry sooner than a full TTL next time, but keep the existing session.
+        with _CLIENT_LOCK:
+            _CLIENT_LAST_LOGIN = time.time() - (_CLIENT_LOGIN_TTL - 60)
+        logger.warning(
+            "Background session refresh failed: %s. "
+            "Keeping existing session (HTTP Basic Auth) — searches still work. "
+            "Will retry in ~60s.",
+            e,
+        )
+    finally:
+        with _CLIENT_LOCK:
+            _CLIENT_REFRESHING = False
+
+
 def client() -> EasynewsClient:
     if not EZ_USER or not EZ_PASS:
         raise RuntimeError("Set EASYNEWS_USER and EASYNEWS_PASS environment variables")
-    global _CLIENT, _CLIENT_LAST_LOGIN
+    global _CLIENT, _CLIENT_LAST_LOGIN, _CLIENT_REFRESHING
     with _CLIENT_LOCK:
         now = time.time()
         if _CLIENT is None:
-            # First-time startup — must succeed
+            # First-time startup — must succeed before we can serve anything.
             logger.info("Starting up: logging in to Easynews for the first time...")
             _CLIENT = EasynewsClient(EZ_USER, EZ_PASS)
             _CLIENT.login()
             _CLIENT_LAST_LOGIN = now
             logger.info("Startup login succeeded. Indexer is ready.")
-        elif now - _CLIENT_LAST_LOGIN > _CLIENT_LOGIN_TTL:
-            # Periodic session refresh.
-            # IMPORTANT: failure here is NOT fatal — the session uses HTTP Basic Auth
-            # so searches will likely still work even if the refresh fails.
+            return _CLIENT
+
+        # Periodic refresh runs in a background thread so the current request is
+        # never blocked on the login round-trip. This is what was causing the
+        # downstream (NZBHydra) ~4s timeouts whenever a refresh coincided with a
+        # search and Easynews was slow to answer the login.
+        if (
+            now - _CLIENT_LAST_LOGIN > _CLIENT_LOGIN_TTL
+            and not _CLIENT_REFRESHING
+        ):
             age_mins = int((now - _CLIENT_LAST_LOGIN) / 60)
             logger.info(
-                "Session is %d min old (TTL=%ds). Refreshing login...",
+                "Session is %d min old (TTL=%ds). Refreshing login in background...",
                 age_mins, _CLIENT_LOGIN_TTL,
             )
-            try:
-                _CLIENT.login()
-                _CLIENT_LAST_LOGIN = time.time()
-                logger.info("Session refresh succeeded.")
-            except EasynewsError as e:
-                # Back off by half the TTL so we retry sooner than normal,
-                # but keep the existing client — don't return a 500.
-                _CLIENT_LAST_LOGIN = now - (_CLIENT_LOGIN_TTL // 2)
-                logger.warning(
-                    "Session refresh failed: %s. "
-                    "Keeping existing session — searches should still work. "
-                    "Will retry login in ~%ds.",
-                    e, _CLIENT_LOGIN_TTL // 2,
-                )
+            _CLIENT_REFRESHING = True
+            # Push the timestamp forward now so we don't spawn a thread per request
+            # while this refresh is in flight; the thread sets the real time on success.
+            _CLIENT_LAST_LOGIN = now
+            threading.Thread(
+                target=_refresh_login_async, name="ez-login-refresh", daemon=True
+            ).start()
         return _CLIENT
+
+
+def _warm_up_login() -> None:
+    """
+    Log in once at startup, in the background, so the first real search after a
+    container (re)start doesn't pay the blocking login cost (which previously
+    pushed that first request past NZBHydra's timeout).
+    """
+    try:
+        client()
+    except Exception as e:  # noqa: BLE001 - never crash startup over a warm-up
+        logger.warning(
+            "Startup warm-up login failed (will retry on first request): %s", e
+        )
+
+
+if EZ_USER and EZ_PASS:
+    threading.Thread(target=_warm_up_login, name="ez-warmup", daemon=True).start()
 
 
 def xml_escape(s: str) -> str:
@@ -239,6 +284,14 @@ _SEASON_EP_RE = re.compile(
     r"(?:s(?P<season>\d{1,2})e(?P<episode>\d{1,2})|(?<!\d)(?P<season2>\d{1,2})x(?P<episode2>\d{1,2})(?!\d))",
     re.IGNORECASE,
 )
+# Bare season marker in a query, e.g. "From S04" / "From.S04" (no episode). This
+# is NOT matched by _SEASON_EP_RE (which needs SxxExx), and the bare "s04" token
+# never appears in episode filenames ("...s04e08..."), so a season-only search
+# would otherwise match nothing. We parse the season here and match via metadata.
+_SEASON_ONLY_RE = re.compile(
+    r"(?:^|[\s\.\-_])s(?P<season>\d{1,2})(?=$|[\s\.\-_])", re.IGNORECASE
+)
+_SEASON_TOKEN_RE = re.compile(r"^s\d{1,2}$", re.IGNORECASE)
 _ANIME_BRACKET_GROUP_RE = re.compile(r"^\[([^\]]+)\]", re.IGNORECASE)
 
 _KNOWN_FANSUB_GROUPS = {
@@ -723,7 +776,15 @@ def api():
             fallback_query = True
 
         query_tokens = _tokenize(raw_query)
+        # Drop bare season tokens like "s04": they never appear literally in
+        # episode filenames ("...s04e08..."), so requiring them as a token would
+        # filter out every real result. The season is enforced via metadata below.
+        query_tokens = [tok for tok in query_tokens if not _SEASON_TOKEN_RE.match(tok)]
         query_meta = _extract_release_markers(raw_query)
+        if query_meta.get("season") is None:
+            season_only = _SEASON_ONLY_RE.search(raw_query)
+            if season_only:
+                query_meta["season"] = int(season_only.group("season"))
         if year_int:
             query_meta["year"] = year_int
         if season_int is not None:
@@ -798,16 +859,15 @@ def api():
         else:
             c = client()
             search_start = time.time()
-            data = _retry_request(
-                lambda: c.search(
-                    query=q,
-                    file_type="VIDEO",
-                    per_page=250,
-                    sort_field="relevance",
-                    sort_dir="-",
-                ),
-                max_retries=3,
-                base_delay=2.0,
+            # Latency-bounded, hedged search: returns the first real results and
+            # is hard-capped well under NZBHydra's 4s timeout, so a slow/hung
+            # Easynews response no longer surfaces as "0 results".
+            data = c.search_hedged(
+                query=q,
+                file_type="VIDEO",
+                per_page=250,
+                sort_field="relevance",
+                sort_dir="-",
             )
             elapsed = time.time() - search_start
             raw_count = len(data.get("data", []))
