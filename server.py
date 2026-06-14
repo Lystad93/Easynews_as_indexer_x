@@ -83,9 +83,23 @@ def _load_dotenv():
 
 _load_dotenv()
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
+
 API_KEY = os.environ.get("NEWZNAB_APIKEY", "testkey")
 EZ_USER = os.environ.get("EASYNEWS_USER")
 EZ_PASS = os.environ.get("EASYNEWS_PASS")
+
+# When enabled, season-pack queries (a season with NO episode, e.g. "The Boys
+# S05") are skipped and return no results. Easynews rarely carries real season
+# packs, so this stops them from polluting season searches. Episode and movie
+# searches are unaffected.
+IGNORE_SEASON_PACKS = _env_bool("IGNORE_SEASON_PACKS", False)
 
 
 def require_apikey() -> bool:
@@ -808,6 +822,17 @@ def api():
         min_bytes = min_size_mb * 1024 * 1024
 
         if fallback_query:
+        season_pack_query = (
+            query_meta.get("season") is not None
+            and query_meta.get("episode") is None
+        )
+        if IGNORE_SEASON_PACKS and season_pack_query and not fallback_query:
+            logger.info(
+                "Skipping season-pack query %r (IGNORE_SEASON_PACKS enabled)",
+                raw_query,
+            )
+            items = []
+        elif fallback_query:
             tv_categories = {"5000", "5030", "5040"}
             anime_categories = {"5070"}
             requested_categories = set(cat_param.split(",")) if cat_param else set()
