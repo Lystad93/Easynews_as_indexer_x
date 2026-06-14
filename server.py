@@ -821,7 +821,6 @@ def api():
                 min_size_mb = 100
         min_bytes = min_size_mb * 1024 * 1024
 
-        if fallback_query:
         season_pack_query = (
             query_meta.get("season") is not None
             and query_meta.get("episode") is None
