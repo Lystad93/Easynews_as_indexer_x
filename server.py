@@ -14,7 +14,14 @@ import requests
 from flask import Flask, Response, request
 import json
 
-from easynews_client import EasynewsClient, EasynewsError, SearchItem
+from easynews_client import (
+    EasynewsClient,
+    EasynewsError,
+    SearchItem,
+    _active_endpoint_label,
+    paginate_enabled,
+    max_pages,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +107,43 @@ EZ_PASS = os.environ.get("EASYNEWS_PASS")
 # packs, so this stops them from polluting season searches. Episode and movie
 # searches are unaffected.
 IGNORE_SEASON_PACKS = _env_bool("IGNORE_SEASON_PACKS", False)
+
+# When enabled, skip the title-matching filters (strict phrase, season/episode/
+# year/quality, and query-token subset). Validity checks (hash/ext, min size,
+# virus/password/duration) still apply. Useful if a downstream client (Sonarr/
+# Radarr) does its own matching and you'd rather hand it everything Easynews
+# returns. Default off → behaviour unchanged.
+DISABLE_RESULT_FILTERS = _env_bool("EASYNEWS_DISABLE_FILTERS", False)
+
+# Extra metadata emitted as newznab:attr so downstream tools can use it. The
+# audio/subtitle language codes come from Easynews's named JSON fields
+# (subtitle_tracks/slangs, audio_tracks/alangs) and only exist when the endpoint
+# returns them (the 3.0 api and the 2.0 dict form do). AIOStreams reads the
+# "subs" attr as subtitle languages and "language" as audio languages — handy
+# for e.g. filtering to Norwegian subtitles. Default on; disable individually.
+# NOTE: if you go through NZBHydra2, it must pass these attrs through to the
+# downstream client (they originate here regardless).
+META_SUBS = _env_bool("EASYNEWS_META_SUBS", True)
+META_AUDIO = _env_bool("EASYNEWS_META_AUDIO", True)
+META_CODECS = _env_bool("EASYNEWS_META_CODECS", True)
+
+
+def _join_langs(value: Any) -> Optional[str]:
+    """Normalise a language field (list like ['nor','eng'] or a comma string)
+    into a clean, de-duplicated, lowercase comma-joined string of ISO codes."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        parts = [p.strip().lower() for p in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(p).strip().lower() for p in value]
+    else:
+        return None
+    seen: List[str] = []
+    for p in parts:
+        if p and p not in seen:
+            seen.append(p)
+    return ",".join(seen) if seen else None
 
 
 def require_apikey() -> bool:
@@ -570,6 +614,7 @@ def filter_and_map(
     token_set: Set[str] = set(query_tokens or [])
     thumb_base = json_data.get("thumbURL") or json_data.get("thumbUrl")
     out: List[dict] = []
+    seen_hashes: Set[str] = set()
     for it in json_data.get("data", []):
         hash_id: Optional[str] = None
         subject: Optional[str] = None
@@ -583,35 +628,50 @@ def filter_and_map(
         extension_field: Optional[str] = None
         duration_raw: Any = None
         fullres: Optional[str] = None
+        sub_langs: Any = None
+        audio_langs: Any = None
+        vcodec: Any = None
+        acodec: Any = None
 
         if isinstance(it, list):
             if len(it) >= 12:
-                hash_id = it[0]
-                subject = it[6]
-                filename_no_ext = it[10]
-                ext = it[11]
+                hash_id = it
+                subject = it
+                filename_no_ext = it
+                ext = it
             if len(it) > 7:
-                poster = it[7]
+                poster = it
             if len(it) > 8:
-                posted_raw = it[8]
+                posted_raw = it
             if len(it) > 14:
-                duration_raw = it[14]
+                duration_raw = it
         elif isinstance(it, dict):
             hash_id = it.get("hash") or it.get("0") or it.get("id")
             subject = it.get("subject") or it.get("6")
-            filename_no_ext = it.get("filename") or it.get("10")
-            ext = it.get("ext") or it.get("11")
-            size = it.get("size", 0)
+            # `fn` / `extension` / `rawSize` / `runtime` are the named fields the
+            # newer 3.0 JSON (and 2.0 dict form) use; the "10"/"11"/"4"/"14"
+            # fallbacks cover the positional 2.0 form. All harmless if absent.
+            filename_no_ext = it.get("filename") or it.get("fn") or it.get("10")
+            ext = it.get("ext") or it.get("extension") or it.get("11")
+            size = it.get("size") or it.get("rawSize") or it.get("4") or 0
             poster = it.get("poster") or it.get("7")
             posted_raw = it.get("timestamp") or it.get("ts") or it.get("dtime") or it.get("date") or it.get("12")
             sig = it.get("sig")
             display_fn = it.get("fn") or it.get("filename")
             extension_field = it.get("extension") or it.get("ext")
-            duration_raw = it.get("14") or it.get("duration") or it.get("len")
+            duration_raw = it.get("runtime") or it.get("14") or it.get("duration") or it.get("len")
             fullres = it.get("fullres") or it.get("resolution")
+            sub_langs = it.get("subtitle_tracks") or it.get("slangs") or it.get("subs")
+            audio_langs = it.get("audio_tracks") or it.get("alangs") or it.get("language")
+            vcodec = it.get("vcodec") or it.get("video_codec")
+            acodec = it.get("acodec") or it.get("audio_codec")
 
         if not hash_id or not ext:
             continue
+
+        if hash_id in seen_hashes:
+            continue
+        seen_hashes.add(hash_id)
 
         filename_no_ext = filename_no_ext or ""
         ext = ext or ""
@@ -653,10 +713,10 @@ def filter_and_map(
         if not quality and title_meta.get("quality"):
             quality = title_meta.get("quality")
 
-        if strict_match and not _matches_strict(title, strict_phrase):
+        if not DISABLE_RESULT_FILTERS and strict_match and not _matches_strict(title, strict_phrase):
             continue
 
-        if query_meta:
+        if not DISABLE_RESULT_FILTERS and query_meta:
             q_year = query_meta.get("year")
             q_season = query_meta.get("season")
             q_episode = query_meta.get("episode")
@@ -674,7 +734,7 @@ def filter_and_map(
             if q_quality and t_quality and q_quality.lower() != t_quality.lower():
                 continue
 
-        if token_set:
+        if not DISABLE_RESULT_FILTERS and token_set:
             title_tokens = set(_tokenize(title))
             if not title_tokens or not token_set.issubset(title_tokens):
                 continue
@@ -700,6 +760,10 @@ def filter_and_map(
                 "year": year,
                 "season": title_meta.get("season"),
                 "episode": title_meta.get("episode"),
+                "subs": _join_langs(sub_langs),
+                "audio_langs": _join_langs(audio_langs),
+                "vcodec": (str(vcodec).strip() or None) if vcodec else None,
+                "acodec": (str(acodec).strip() or None) if acodec else None,
             }
         )
     return out
@@ -893,6 +957,16 @@ def api():
                 sort_field="relevance",
                 sort_dir="-",
             )
+            # Optional extra pages (EASYNEWS_PAGINATE). Off by default; adds
+            # latency, so only worth it when you've raised the search budget.
+            if paginate_enabled() and data.get("data"):
+                extra_rows = c.fetch_more_pages(
+                    q, file_type="VIDEO", per_page=250,
+                    sort_field="relevance", sort_dir="-",
+                    start_page=2, max_pages=max_pages(),
+                )
+                if extra_rows:
+                    data = {**data, "data": list(data.get("data") or []) + extra_rows}
             elapsed = time.time() - search_start
             raw_count = len(data.get("data", []))
             items = filter_and_map(
@@ -904,8 +978,8 @@ def api():
                 strict_match=strict_requested,
             )
             logger.info(
-                "Search %r → %d raw results, %d passed filters, in %.1fs",
-                q, raw_count, len(items), elapsed,
+                "Search %r [%s] → %d raw results, %d passed filters, in %.1fs",
+                q, _active_endpoint_label(), raw_count, len(items), elapsed,
             )
 
         items = items[offset : offset + limit]
@@ -973,6 +1047,17 @@ def api():
                 attr_parts.append(f'<newznab:attr name="season" value="{season}"/>')
             if episode:
                 attr_parts.append(f'<newznab:attr name="episode" value="{episode}"/>')
+            # Language/codec metadata. AIOStreams reads "subs" as subtitle
+            # languages and "language" as audio languages; emit one comma-joined
+            # value per attr (duplicate attr names get overwritten downstream).
+            if META_SUBS and it.get("subs"):
+                attr_parts.append(f'<newznab:attr name="subs" value="{xml_escape(it["subs"])}"/>')
+            if META_AUDIO and it.get("audio_langs"):
+                attr_parts.append(f'<newznab:attr name="language" value="{xml_escape(it["audio_langs"])}"/>')
+            if META_CODECS and it.get("vcodec"):
+                attr_parts.append(f'<newznab:attr name="video" value="{xml_escape(it["vcodec"])}"/>')
+            if META_CODECS and it.get("acodec"):
+                attr_parts.append(f'<newznab:attr name="audio" value="{xml_escape(it["acodec"])}"/>')
             attr_xml = "".join(attr_parts)
             item_xml = (
                 f"<item>"
