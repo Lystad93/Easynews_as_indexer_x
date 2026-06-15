@@ -290,26 +290,33 @@ class EasynewsClient:
     ) -> str:
         """Builder for the newer /3.0/api/search JSON endpoint.
 
-        NOTE: the 3.0 request params are not officially documented. These mirror
-        the 2.0 solr params (which Easynews endpoints largely share). If 3.0
-        returns nothing, confirm the real params from the 3.0 web UI's DevTools
-        Network tab and adjust here, or set EASYNEWS_SEARCH_URL_TEMPLATE to the
-        exact request.
+        Confirmed against a live account: the path takes NO trailing slash
+        (``/3.0/api/search`` — a trailing slash 404s to the web-app HTML), and
+        it accepts the same params as the 2.0 solr endpoint. ``vv=1`` is what
+        makes it return the rich per-file metadata (runtime, vcodec/acodec,
+        audio_tracks, subtitle tracks), so we keep the full param set. The
+        response is leaner JSON than 2.0 with the same fields.
         """
+        if file_type != "VIDEO":
+            file_type = "VIDEO"
         params = {
-            "gps": query,
+            "fly": "2",
+            "sb": "1",
             "pno": str(page),
             "pby": str(per_page),
-            "fly": "2",
             "u": "1",
+            "chxu": "1",
+            "chxgx": "1",
             "st": "basic",
+            "gps": query,
+            "vv": "1",  # include video metadata (runtime/codecs/languages)
             "safeO": str(safe_off),
             "_nonce": str(nonce if nonce is not None else random.random()),
         }
         if sort_field:
             params["s1"] = sort_field
             params["s1d"] = sort_dir
-        url = f"{EASYNEWS_BASE}/3.0/api/search/"
+        url = f"{EASYNEWS_BASE}/3.0/api/search"  # NB: no trailing slash
         query_params = (
             "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
             + f"&fty%5B%5D={requests.utils.quote(file_type)}"
