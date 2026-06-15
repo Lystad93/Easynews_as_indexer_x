@@ -89,6 +89,30 @@ To tail logs from the detached container run `docker logs -f <container-id>`.
 - Download NZB: `GET /api?t=get&id=<encoded>&apikey=<key>`
 	- Filename equals the item title
 
+## Optional configuration
+
+All optional and read at startup — set them in `.env` (or `-e` flags) and restart. See `.env.example` for the fully annotated list.
+
+**Search endpoint (A/B testing speed).** Switch which Easynews endpoint is used:
+
+- `EASYNEWS_SEARCH_API` — `2.0` (default, `/2.0/search/solr-search/`) or `3.0` (`/3.0/api/search/`, newer JSON API)
+- `EASYNEWS_SEARCH_URL_TEMPLATE` — full URL override if the 3.0 params differ (placeholders `{base}` `{query}` `{page}` `{per_page}`); wins over `EASYNEWS_SEARCH_API`
+- `EASYNEWS_BASE_URL`, `EASYNEWS_RESULTS_KEY`, `EASYNEWS_LOG_LATENCY` — host override, alternate JSON results key, and per-request latency logging
+
+`easynews_endpoint_benchmark.sh` curls both endpoints and times them so you can compare. The NZB download path always uses `/2.0/api/dl-nzb`.
+
+**Language / codec metadata.** Emitted as `newznab:attr` so downstream tools (e.g. AIOStreams, which reads `subs` for subtitle languages and `language` for audio) can filter by language — handy for, say, Norwegian (`nor`) subtitles. Default on:
+
+- `EASYNEWS_META_SUBS`, `EASYNEWS_META_AUDIO`, `EASYNEWS_META_CODECS` — set any to `false` to drop that attribute
+
+These codes come from Easynews's JSON and are present on the 3.0 API / 2.0 dict responses. If you route through NZBHydra2, it must be set to pass these attributes through.
+
+**Other:**
+
+- `EASYNEWS_DISABLE_FILTERS=true` — skip title-matching filters (validity, size, virus/duration checks still apply)
+- `EASYNEWS_PAGINATE=true` + `EASYNEWS_MAX_PAGES=<n>` — fetch extra result pages (deduped). Off by default; adds latency, so raise `SEARCH_BUDGET_SECONDS` and your indexer timeout if you enable it.
+- `IGNORE_SEASON_PACKS=true` — skip season-only queries Easynews rarely fulfils
+
 ## Prowlarr integration
 
 Add a Newznab (generic) indexer in Prowlarr:
