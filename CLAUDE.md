@@ -63,6 +63,7 @@ See `.env.example` for the full annotated list. Summary:
 | `SEARCH_BUDGET_SECONDS` | `3.3` | Hard cap on total time per search |
 | `SEARCH_HEDGE_AFTER_SECONDS` | `1.2` | Fire a parallel "hedge" request if Easynews is slower than this |
 | `SEARCH_ATTEMPT_TIMEOUT_SECONDS` | `2.5` | Per-request read timeout |
+| `SEARCH_TRUST_EMPTY` | `true` | Treat a fast successful "0 results" as final (no-result queries ~0.3s vs ~3.3s); `false` = old 3-try-on-empty |
 | `IGNORE_SEASON_PACKS` | `false` | Skip season-only queries (season, no episode) — Easynews rarely has real packs |
 | `EASYNEWS_SEARCH_API` | `2.0` | Search endpoint: `2.0` (`/2.0/search/solr-search/`) or `3.0` (`/3.0/api/search`, no trailing slash) |
 | `EASYNEWS_BASE_URL` | `https://members.easynews.com` | Override the Easynews host |
@@ -116,9 +117,13 @@ min file size `100` MB (also per-request via `&minsize=`), `_MIN_DURATION_SECOND
   login**, so a search never blocks on a slow/flaky Easynews login. Inline login
   on the request path was the original cause of downstream ~4 s timeouts.
 - **`search_hedged()`** returns the first *real* results and is hard-capped under
-  `SEARCH_BUDGET_SECONDS`; if Easynews is slow it races a fresh parallel request
-  instead of returning a spurious "0 results". Genuinely-empty results can't be
-  invented.
+  `SEARCH_BUDGET_SECONDS`; if Easynews is slow (or errors) it races a fresh
+  parallel request instead of returning a spurious "0 results". A *hang/timeout
+  is an error* (it retries + hedges), whereas a successful HTTP 200 with no rows
+  is a genuine "0 results" — so with `SEARCH_TRUST_EMPTY=true` (default) that
+  empty returns immediately rather than retrying 3× and idling out the budget
+  (no-result queries drop from ~3.3s to ~0.3s). Set `SEARCH_TRUST_EMPTY=false`
+  to restore the old 3-try-on-empty behaviour.
 - **Season-only searches** (e.g. `From S04`) parse a bare `Sxx` into metadata and
   do *not* require an `s04` literal token (it never appears in `…s04e08…` names).
 
