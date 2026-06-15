@@ -64,7 +64,7 @@ See `.env.example` for the full annotated list. Summary:
 | `SEARCH_HEDGE_AFTER_SECONDS` | `1.2` | Fire a parallel "hedge" request if Easynews is slower than this |
 | `SEARCH_ATTEMPT_TIMEOUT_SECONDS` | `2.5` | Per-request read timeout |
 | `IGNORE_SEASON_PACKS` | `false` | Skip season-only queries (season, no episode) — Easynews rarely has real packs |
-| `EASYNEWS_SEARCH_API` | `2.0` | Search endpoint: `2.0` (`/2.0/search/solr-search/`) or `3.0` (`/3.0/api/search/`) |
+| `EASYNEWS_SEARCH_API` | `2.0` | Search endpoint: `2.0` (`/2.0/search/solr-search/`) or `3.0` (`/3.0/api/search`, no trailing slash) |
 | `EASYNEWS_BASE_URL` | `https://members.easynews.com` | Override the Easynews host |
 | `EASYNEWS_SEARCH_URL_TEMPLATE` | — | Full search-URL override (wins over `SEARCH_API`); placeholders `{base}{query}{page}{per_page}` |
 | `EASYNEWS_RESULTS_KEY` | `data` | Top-level JSON key holding result rows |
@@ -81,13 +81,16 @@ rebuild). Keep this invariant true:
 `HEDGE_AFTER < ATTEMPT_TIMEOUT ≤ BUDGET < client's indexer timeout`.
 
 **Search endpoint (2.0 vs 3.0).** `EASYNEWS_SEARCH_API` switches between the proven
-`/2.0/search/solr-search/` and the newer JSON `/3.0/api/search/`. Default is `2.0`,
-so behaviour is unchanged unless you opt in. The 3.0 request params aren't
-officially documented — if it returns nothing, grab the real request from the 3.0
-web UI's DevTools and set `EASYNEWS_SEARCH_URL_TEMPLATE` (no code change). The NZB
-**download** path stays on `/2.0/api/dl-nzb` regardless. `EASYNEWS_LOG_LATENCY` and
-the per-search log line (`Search 'x' [api 3.0] → …`) are there to compare speed;
-`easynews_endpoint_benchmark.sh` does an A/B curl test.
+`/2.0/search/solr-search/` and the newer JSON `/3.0/api/search`. Default is `2.0`,
+so behaviour is unchanged unless you opt in. Confirmed against a live account:
+the 3.0 path takes **no trailing slash** (a trailing slash 404s to the web-app
+HTML), accepts the same params as 2.0 (we keep `vv=1`, which is what returns the
+runtime/codec/language metadata), and returns a leaner JSON payload (~3x smaller)
+with the same `data` rows. If a future param change breaks it, grab the real
+request from the 3.0 web UI's DevTools and set `EASYNEWS_SEARCH_URL_TEMPLATE` (no
+code change). The NZB **download** path stays on `/2.0/api/dl-nzb` regardless.
+`EASYNEWS_LOG_LATENCY` and the per-search log line (`Search 'x' [api 3.0] → …`)
+are there to compare speed; `easynews_endpoint_benchmark.sh` does an A/B curl test.
 
 **Language/codec metadata.** `subs`/`language`/`video`/`audio` attrs are populated
 from Easynews's named JSON fields (`subtitle_tracks`/`slangs`, `audio_tracks`/`alangs`,
