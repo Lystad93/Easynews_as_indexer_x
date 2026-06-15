@@ -661,8 +661,14 @@ def filter_and_map(
             extension_field = it.get("extension") or it.get("ext")
             duration_raw = it.get("runtime") or it.get("14") or it.get("duration") or it.get("len")
             fullres = it.get("fullres") or it.get("resolution")
-            sub_langs = it.get("subtitle_tracks") or it.get("slangs") or it.get("subs")
-            audio_langs = it.get("audio_tracks") or it.get("alangs") or it.get("language")
+            sub_langs = (
+                it.get("subtitle_tracks") or it.get("slang") or it.get("slangs")
+                or it.get("subs")
+            )
+            audio_langs = (
+                it.get("audio_tracks") or it.get("alang") or it.get("alangs")
+                or it.get("language")
+            )
             vcodec = it.get("vcodec") or it.get("video_codec")
             acodec = it.get("acodec") or it.get("audio_codec")
 
