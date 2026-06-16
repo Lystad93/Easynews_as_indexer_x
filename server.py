@@ -123,6 +123,15 @@ DISABLE_RESULT_FILTERS = _env_bool("EASYNEWS_DISABLE_FILTERS", False)
 # Default off = keep first (unchanged behaviour).
 DEDUP_KEEP_NEWEST = _env_bool("EASYNEWS_DEDUP_KEEP_NEWEST", False)
 
+# Keep results Easynews flags as password-protected. The flag is a heuristic and
+# often a false positive — especially on VIDEO results, where Easynews returns
+# full metadata (runtime/codecs) it could only read if the file weren't actually
+# locked — and when something is genuinely passworded the password is usually
+# posted alongside in an NFO/TXT. stremthru and AIOStreams keep these; this lets
+# you match that. Virus-flagged items are still always dropped. Default off
+# (drop password-flagged), unchanged behaviour.
+ALLOW_PASSWORD = _env_bool("EASYNEWS_ALLOW_PASSWORD", False)
+
 # Extra metadata emitted as newznab:attr so downstream tools can use it. The
 # audio/subtitle language codes come from Easynews's named JSON fields
 # (subtitle_tracks/slangs, audio_tracks/alangs) and only exist when the endpoint
@@ -508,7 +517,9 @@ def _is_flagged_item(item: Any, ext: str, duration_seconds: Optional[int]) -> bo
         passwd = bool(item.get("passwd") or item.get("password"))
         virus = bool(item.get("virus"))
         file_type = str(item.get("type") or item.get("file_type") or "").upper()
-    if passwd or virus:
+    if virus:
+        return True
+    if passwd and not ALLOW_PASSWORD:
         return True
     if file_type and file_type != "VIDEO":
         return True
