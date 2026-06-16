@@ -457,20 +457,31 @@ def _tokenize(text: str) -> List[str]:
 
 
 _MULTIDASH_RE = re.compile(r"-{2,}")
+# A leading operator (- ! +) that targets a NUMBER, e.g. "!1080p", "-720p".
+# NZBHydra's capability probes look like this; real film titles never do, so
+# this is safe for titles that *contain* "!" (Airplane!, Mamma Mia!, Mother!,
+# Tora! Tora! Tora!) and even ones that *start* with it (!Women Art Revolution).
+_LEADING_OP_NUM_RE = re.compile(r"^[!+\-](?=\d)")
 
 
 def _clean_search_query(text: str) -> str:
-    """Neutralise client quirks before sending the query to Easynews: collapse
-    runs of dashes (e.g. "Avengers --1080p" → "Avengers 1080p", which Easynews
-    otherwise treats as a broken exclude and answers slowly/empty) and strip
-    stray leading dashes per token. Internal single dashes (hyphenated titles
-    like "Spider-Man") are preserved. Downstream filtering still uses the raw
-    query, so this only changes what we ask Easynews."""
+    """Neutralise client query operators before sending to Easynews. Clients
+    (notably NZBHydra's capability probes) send things like "Avengers --1080p"
+    or "Avengers !1080p" to test exclusion support; Easynews treats those as
+    broken queries and answers slowly/empty. We collapse dash runs, strip stray
+    quotes, and drop a leading operator only when it targets a number (so it's
+    a quality exclusion, not punctuation in a title). Title "!"/"-" punctuation
+    is preserved. Downstream filtering still uses the raw query, so this only
+    changes what we ask Easynews."""
     if not text:
         return text
-    cleaned = _MULTIDASH_RE.sub(" ", text)
-    cleaned = " ".join(tok.lstrip("-") for tok in cleaned.split())
-    return cleaned.strip()
+    cleaned = _MULTIDASH_RE.sub(" ", text).replace('"', " ")
+    tokens = []
+    for tok in cleaned.split():
+        tok = _LEADING_OP_NUM_RE.sub("", tok)
+        if tok:
+            tokens.append(tok)
+    return " ".join(tokens).strip()
 
 
 def _sanitize_phrase(text: str) -> str:
