@@ -386,7 +386,11 @@ _ALLOWED_VIDEO_EXTENSIONS = {
 _STOPWORDS = {"the", "a", "an", "and", "of", "in", "for", "on"}
 
 _MIN_DURATION_SECONDS = 60
-_TOKEN_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
+# Split on underscores too ([\W_] = anything that isn't a letter/digit). Fansub
+# groups (HorribleSubs, Coalgirls, Erai-raws, SubsPlease) join words with "_",
+# e.g. "[Coalgirls]_Occult_Academy_03_..."; without this the whole name becomes
+# one glued token and the release is wrongly dropped.
+_TOKEN_SPLIT_RE = re.compile(r"[\W_]+", re.UNICODE)
 _QUALITY_RE = re.compile(r"(2160|1440|1080|720|480|360)\s*(p|i)?", re.IGNORECASE)
 _YEAR_RE = re.compile(r"(19|20)\d{2}")
 _SEASON_EP_RE = re.compile(
@@ -787,6 +791,11 @@ def filter_and_map(
             if hash_id in seen_hashes:
                 continue
             seen_hashes.add(hash_id)
+
+        # macOS AppleDouble sidecar ("._name") — a metadata stub, not real media.
+        # Always dropped (even with EASYNEWS_DISABLE_FILTERS); never useful.
+        if (filename_no_ext or "").lstrip().startswith("._"):
+            continue
 
         filename_no_ext = filename_no_ext or ""
         ext = ext or ""
