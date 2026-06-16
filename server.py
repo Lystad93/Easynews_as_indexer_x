@@ -132,6 +132,13 @@ DEDUP_KEEP_NEWEST = _env_bool("EASYNEWS_DEDUP_KEEP_NEWEST", False)
 # (drop password-flagged), unchanged behaviour.
 ALLOW_PASSWORD = _env_bool("EASYNEWS_ALLOW_PASSWORD", False)
 
+# Drop connector stopwords (and/of/the/…) from the query sent to Easynews.
+# Easynews AND-matches every query word, so a word absent from the release name
+# (e.g. clients expand "Escha & Logy" → "Escha and Logy", but releases write
+# "Escha..Logy") zeroes out the whole search. Filtering still uses the full
+# token set, so precision is unchanged. Default on (it's a recall fix).
+STRIP_STOPWORDS = _env_bool("EASYNEWS_STRIP_STOPWORDS", True)
+
 # Extra metadata emitted as newznab:attr so downstream tools can use it. The
 # audio/subtitle language codes come from Easynews's named JSON fields
 # (subtitle_tracks/slangs, audio_tracks/alangs) and only exist when the endpoint
@@ -498,6 +505,18 @@ def _clean_search_query(text: str) -> str:
         if tok:
             tokens.append(tok)
     return " ".join(tokens).strip()
+
+
+def _strip_search_stopwords(text: str) -> str:
+    """Drop connector stopwords (and/of/the/…) from the query sent to Easynews.
+    Easynews AND-matches every query word, so a word absent from the release
+    name (e.g. clients expand "Escha & Logy" → "Escha and Logy", but releases
+    write "Escha..Logy") zeroes out the whole search. Returns the original text
+    if every token is a stopword."""
+    if not text:
+        return text
+    toks = [t for t in text.split() if t.lower() not in _STOPWORDS]
+    return " ".join(toks) if toks else text
 
 
 def _sanitize_phrase(text: str) -> str:
@@ -1072,9 +1091,13 @@ def api():
             c = client()
             search_start = time.time()
             # Sanitise the outbound query so a client quirk like "Avengers
-            # --1080p" doesn't become a broken/slow Easynews query. Filtering
-            # still uses the raw query (query_tokens/strict_phrase).
+            # --1080p" doesn't become a broken/slow Easynews query, and drop
+            # connector stopwords so an expanded title ("…Escha and Logy…")
+            # doesn't zero out the search against a release named "…Escha..Logy…".
+            # Filtering still uses the raw query (query_tokens/strict_phrase).
             search_q = _clean_search_query(q)
+            if STRIP_STOPWORDS:
+                search_q = _strip_search_stopwords(search_q)
 
             # Kick off the extra-term searches (EASYNEWS_EXTRA_TERMS) CONCURRENTLY
             # with the bare search, so a slow query doesn't pay for them serially
