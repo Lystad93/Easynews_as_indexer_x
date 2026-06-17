@@ -3,13 +3,43 @@ services:
     image: ghcr.io/lystad93/easynews_as_indexer_x:latest
     container_name: easynews-indexer
     restart: unless-stopped
-    labels:
-      - "dockhand.hidden=true"
-      - "dockhand.order=1"
-    expose:
-      - ${PORT}
+    expose: ["8081"]
     env_file:
       - .env
+    # environment:
+      # - EASYNEWS_PAGINATE=true
+      # - EASYNEWS_REQUIRE_SUBS=nor
+      # - EASYNEWS_EXTRA_TERMS=nordic
     profiles:
       - easynews-indexer
       - all
+
+### Uncomment if you want what my testing (currently) is showing best results for NORDIC releases
+### You can run them all at the same time, the host url for nordic is http://easynews-indexer-nor:8081
+  # easynews-indexer-nor:
+  #   image: ghcr.io/lystad93/easynews_as_indexer_x:latest
+  #   container_name: easynews-indexer-nor
+  #   restart: unless-stopped
+  #   expose: ["8081"]
+  #   env_file: [.env]            # inherits creds + NEWZNAB_APIKEY in .env
+  #   environment:
+  #     - EASYNEWS_REQUIRE_SUBS=nor
+  #     - EASYNEWS_ALLOW_PASSWORD=false
+  #     - EASYNEWS_EXTRA_TERMS=nordic
+  #   profiles: [easynews-indexer, all]
+
+### Uncomment if you want what my testing (currently) is showing best results for anime releases
+### You can run them all at the same time, the host url for anime is http://easynews-indexer-anime:8081
+  # easynews-indexer-anime:
+  #   image: ghcr.io/lystad93/easynews_as_indexer_x:latest
+  #   container_name: easynews-indexer-anime
+  #   restart: unless-stopped
+  #   expose: ["8081"]
+  #   env_file: [.env]            # inherits creds + NEWZNAB_APIKEY in .env
+  #   environment:
+  #     - IGNORE_SEASON_PACKS=false
+  #     - EASYNEWS_DISABLE_FILTERS=true
+  #     - SEARCH_ATTEMPT_TIMEOUT_SECONDS=8
+  #     - SEARCH_HEDGE_AFTER_SECONDS=4
+  #     - SEARCH_BUDGET_SECONDS=10 
+  #   profiles: [easynews-indexer, all]
