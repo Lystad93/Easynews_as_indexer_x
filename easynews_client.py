@@ -99,6 +99,20 @@ _SEARCH_BUDGET = float(os.environ.get("SEARCH_BUDGET_SECONDS", "3.3"))
 _SEARCH_HEDGE_AFTER = float(os.environ.get("SEARCH_HEDGE_AFTER_SECONDS", "1.2"))
 _SEARCH_ATTEMPT_TIMEOUT = float(os.environ.get("SEARCH_ATTEMPT_TIMEOUT_SECONDS", "2.5"))
 
+# Keepalive (overridable via env). A background thread holds a warm TLS
+# connection open during idle gaps so the next real search skips the cold
+# handshake. Toggle the whole thing off with EASYNEWS_KEEPALIVE=false (e.g. to
+# minimise idle account activity); a search will simply pay the handshake cost.
+#   enabled  – master on/off switch (default on, unchanged behaviour)
+#   interval – how often the background thread wakes to maybe ping
+#   idle     – only ping after this many seconds of no real search traffic
+_KEEPALIVE_ENABLED = os.environ.get("EASYNEWS_KEEPALIVE", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_KEEPALIVE_INTERVAL = float(os.environ.get("EASYNEWS_KEEPALIVE_INTERVAL_SECONDS", "45"))
+_KEEPALIVE_IDLE = float(os.environ.get("EASYNEWS_KEEPALIVE_IDLE_SECONDS", "40"))
+
+
 # Trust a successful HTTP-200-with-no-data as a genuine "0 results" and return
 # immediately, instead of retrying up to max_attempts and idling out the budget.
 # A real hang/timeout surfaces as an *error* (which still retries + hedges), so
@@ -261,7 +275,11 @@ class EasynewsClient:
 
         logger.info("Login succeeded.")
 
-    def start_keepalive(self, interval: float = 45.0, idle_after: float = 40.0) -> None:
+    def start_keepalive(
+        self,
+        interval: float = _KEEPALIVE_INTERVAL,
+        idle_after: float = _KEEPALIVE_IDLE,
+    ) -> None:
         """
         Hold a warm TLS connection open during idle gaps so the next real search
         skips the cold handshake. Pings the lightest possible search (one result)
@@ -269,7 +287,13 @@ class EasynewsClient:
         is configured. Only fires after ``idle_after`` seconds of no search traffic,
         so active bursts keep it out of the way. Best-effort and stateless — a
         failed ping is harmless (the next search re-authenticates regardless).
+
+        Disabled entirely when EASYNEWS_KEEPALIVE is false — searches then just
+        pay the TLS handshake cost on the first request after an idle gap.
         """
+        if not _KEEPALIVE_ENABLED:
+            logger.info("Keepalive disabled (EASYNEWS_KEEPALIVE=false).")
+            return
         if self._keepalive_started:
             return
         self._keepalive_started = True
