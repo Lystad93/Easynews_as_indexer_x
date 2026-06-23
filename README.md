@@ -143,6 +143,8 @@ Credentials are required; everything else is optional and read at startup. Set t
 | `SEARCH_HEDGE_AFTER_SECONDS` | `1.2` | Fire a parallel hedge request after this delay |
 | `SEARCH_ATTEMPT_TIMEOUT_SECONDS` | `2.5` | Per-request read timeout |
 | `SEARCH_TRUST_EMPTY` | `true` | Return a fast valid "0 results" instead of retrying |
+| `EASYNEWS_KEEPALIVE` | `true` | Keep a warm TLS connection during idle gaps; `false` disables the background ping |
+| `EASYNEWS_KEEPALIVE_INTERVAL_SECONDS` / `_IDLE_SECONDS` | `45` / `40` | Keepalive ping cadence and idle threshold |
 | `EASYNEWS_SEARCH_API` | `2.0` | `2.0` (solr) or `3.0` (newer JSON API) |
 | `EASYNEWS_SEARCH_URL_TEMPLATE` | — | Full search-URL override (`{base}`/`{query}`/`{page}`/`{per_page}`) |
 | `EASYNEWS_META_SUBS` / `_AUDIO` / `_CODECS` | `true` | Emit subtitle/audio/codec `newznab:attr` |
