@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 APP = Flask(__name__)
 _CLIENT: Optional[EasynewsClient] = None
 _CLIENT_LOCK = threading.Lock()
-_CLIENT_LOGIN_TTL = 1800  # seconds between session refreshes
+_CLIENT_LOGIN_TTL = 86400  # seconds between session refreshes
 _CLIENT_LAST_LOGIN: float = 0.0
 _CLIENT_REFRESHING = False  # guard so only one background refresh runs at a time
 
