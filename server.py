@@ -241,6 +241,7 @@ def client() -> EasynewsClient:
             _CLIENT = EasynewsClient(EZ_USER, EZ_PASS)
             _CLIENT.login()
             _CLIENT_LAST_LOGIN = now
+            _CLIENT.start_keepalive()
             logger.info("Startup login succeeded. Indexer is ready.")
             return _CLIENT
 
