@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
+from query_replace import parse_rules as _parse_query_replace, apply_rules as _apply_query_replace
 
 import requests
 from flask import Flask, Response, request
@@ -138,6 +139,13 @@ ALLOW_PASSWORD = _env_bool("EASYNEWS_ALLOW_PASSWORD", False)
 # "Escha..Logy") zeroes out the whole search. Filtering still uses the full
 # token set, so precision is unchanged. Default on (it's a recall fix).
 STRIP_STOPWORDS = _env_bool("EASYNEWS_STRIP_STOPWORDS", True)
+
+# Per-title query overrides. Rewrites a specific incoming TITLE to the form a
+# release is actually posted under (e.g. Norsemen -> Vikingane, or fixing an
+# upstream-mangled "ikke lov a le pa hytta" -> "...aa...paa..."). Applied to the
+# title only and used for BOTH the outbound query and the title filters, so a
+# rename doesn't then reject every result. See query_replace.py. Default off.
+QUERY_REPLACE = _parse_query_replace(os.getenv("EASYNEWS_QUERY_REPLACE", ""))
 
 # Transliterate Norwegian letters (ø→oe, å→aa, æ→ae, and uppercase) everywhere
 # the query is matched. Scene/Usenet releases routinely ASCII-fold these — a film
@@ -986,6 +994,11 @@ def api():
 
     if t in ("search", "movie", "tvsearch"):
         base_query = (request.args.get("q") or "").strip()
+        if QUERY_REPLACE and base_query:
+            rewritten = _apply_query_replace(base_query, QUERY_REPLACE)
+            if rewritten != base_query:
+                logger.info("Query override: %r -> %r", base_query, rewritten)
+                base_query = rewritten
         cat_param = request.args.get("cat") or ""
         season_param = request.args.get("season") or request.args.get("seasonnum")
         episode_param = (
