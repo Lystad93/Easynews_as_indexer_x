@@ -1,10 +1,29 @@
 {
   "_comment": "Curated alternate-title map for the 0-result fallback search (EASYNEWS_FALLBACK_ALT_TITLES). Canonical/queried title -> list of alternate names releases are actually posted under. Matching is case-insensitive, direct + substring (either direction). Same format as upstream easynews-plus-plus custom-titles.json. Edit freely; keys beginning with an underscore (like this one) are ignored.",
-  "Walking Dead": ["The Walking Dead"],
-  "Fast and Furious": ["The Fast and the Furious"],
-  "Fast X": ["Fast and Furious 10", "Fast X"],
-  "The Avengers": ["Marvels The Avengers", "Marvels Avengers"],
-  "Wednesday": ["Addams Family Wednesday"],
-  "Norsemen": ["Vikingane"],
-  "Lilyhammer": ["Lilyhammer"]
+  "Walking Dead": [
+    "The Walking Dead"
+  ],
+  "Fast and Furious": [
+    "The Fast and the Furious"
+  ],
+  "Fast X": [
+    "Fast and Furious 10",
+    "Fast X"
+  ],
+  "The Avengers": [
+    "Marvels The Avengers",
+    "Marvels Avengers"
+  ],
+  "Wednesday": [
+    "Addams Family Wednesday"
+  ],
+  "Norsemen": [
+    "Vikingane"
+  ],
+  "Lilyhammer": [
+    "Lilyhammer"
+  ],
+  "Ikke lov a le pa hytta": [
+    "Ikke lov aa le paa hytta"
+  ]
 }
