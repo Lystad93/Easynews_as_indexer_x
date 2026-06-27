@@ -81,6 +81,9 @@ See `.env.example` for the full annotated list. Summary:
 | `EASYNEWS_META_SUBS` | `true` | Emit subtitle langs as `newznab:attr name="subs"` |
 | `EASYNEWS_META_AUDIO` | `true` | Emit audio langs as `newznab:attr name="language"` |
 | `EASYNEWS_META_CODECS` | `true` | Emit video/audio codecs as `newznab:attr name="video"`/`"audio"` |
+| `EASYNEWS_META_BITRATE` | `true` | Emit video bitrate as `newznab:attr name="bitrate"` (e.g. `12.72 Mbps`) from raw `bps` (2 dp; more precise than `prettyBps`) |
+| `EASYNEWS_META_GROUP` | `true` | Emit Usenet group(s) as `newznab:attr name="group"` |
+| `EASYNEWS_META_PASSWORD` | `true` | Emit password flag as `newznab:attr name="password"` (`1`/`0`) |
 | `EASYNEWS_EXTRA_TERMS` | — | Comma-separated; also runs `<query> <term>` per term and merges (e.g. `nordic, danish` surfaces deep-ranked language-tagged releases on page 1) |
 | `EASYNEWS_REQUIRE_SUBS` | — | Comma-separated lang codes (e.g. `nor`); keep only releases whose subtitle tracks include one. Per-request override: `&subs=nor` on the `/api` URL |
 | `EASYNEWS_PAGINATE` | `false` | Fetch extra search pages (concurrent, hash-deduped) — adds latency |
@@ -91,6 +94,16 @@ See `.env.example` for the full annotated list. Summary:
 | `EASYNEWS_SORT_1` / `_DIR` | `relevance` / `-` | Primary sort key + direction (`-` desc, `+` asc). Fields: `relevance`, `dsize`, `dtime`, `dsubject` |
 | `EASYNEWS_SORT_2` / `_DIR` | — / `-` | Secondary sort tie-breaker (empty = off) |
 | `EASYNEWS_SORT_3` / `_DIR` | — / `-` | Tertiary sort tie-breaker (empty = off) |
+| `EASYNEWS_MIN_DURATION_SECONDS` | `60` | Drop videos shorter than this (kills 2–5 min sample clips; try `360`) |
+| `EASYNEWS_CACHE_TTL_SECONDS` | `0` | Cache final result list per query for N s (repeat polls served from memory). `0` = off. Keep short (60–180) so new posts aren't hidden |
+| `EASYNEWS_CACHE_MAX_ENTRIES` | `512` | Max cached queries; oldest evicted first (LRU) |
+| `EASYNEWS_FALLBACK_SEARCH` | `false` | On a 0-result query only, run backup searches from alternate spellings + alternate titles |
+| `EASYNEWS_FALLBACK_TRANSLITERATE` | `true` | (fallback) include alternate ASCII spellings (Nordic+German digraph/bare-vowel + accent strip) |
+| `EASYNEWS_FALLBACK_ALT_TITLES` | `true` | (fallback) include curated aliases from the custom-titles file |
+| `EASYNEWS_CUSTOM_TITLES_FILE` | `custom-titles.json` | Path to the canonical→aliases JSON map |
+| `EASYNEWS_FALLBACK_MAX_QUERIES` | `6` | Cap on concurrent backup queries |
+| `EASYNEWS_FALLBACK_BUDGET_SECONDS` | `4.0` | Wall-clock budget for the backup stage (runs after the primary) |
+| `EASYNEWS_EXTRA_TERMS_FALLBACK_ONLY` | `false` | Run `EXTRA_TERMS` only on a 0-result query, not on every search |
 
 All of the above are read at **container start** (change `.env` → `up -d`, no
 rebuild). Keep this invariant true:
@@ -120,6 +133,31 @@ it actually helps. Sorting is now multi-level and env-driven via
 defaults are unchanged. Both knobs are built entirely in `easynews_client.py`'s
 URL builders, so `server.py` is untouched. Recommended order for an indexer:
 `SORT_1=dsize`, `SORT_2=relevance`, `SORT_3=dtime`.
+
+**Result cache.** `EASYNEWS_CACHE_TTL_SECONDS>0` turns on a process-global,
+TTL-bounded LRU cache (`_SEARCH_CACHE` in `server.py`) of the final mapped+filtered
+item list, keyed by the effective query + min-size + strict flag + `subs`. Repeat
+polls (Prowlarr/Sonarr/Radarr RSS sync, re-runs, multiple apps) are served from
+memory; `offset`/`limit` are sliced *after* the cache so paging one search reuses
+one entry. The single-worker / shared-threads gunicorn setup means a plain dict is
+shared across all request threads. Keep the TTL short — it caches empties too, so a
+long TTL hides a just-posted release until expiry. Default `0` = off.
+
+**0-result fallback (alternate spellings + titles).** `EASYNEWS_FALLBACK_SEARCH`
+adds a backup stage that runs *only when the primary search returns nothing*, so
+it never spends extra Easynews requests on a query that already worked. It builds
+candidate queries from `_spelling_variants()` (multi-convention transliteration —
+Nordic+German digraph, bare-vowel, and a full NFKD accent strip; empty for an
+already-ASCII title, so no wasted query) and `_alternative_titles()` (curated
+aliases from `custom-titles.json`, direct + substring match, aliases also spelling-
+folded). Each candidate keeps the original season/episode/year suffix and is matched
+against *itself* (its own tokens/strict-phrase), then results merge hash-deduped.
+Candidates run concurrently single-shot, capped by `EASYNEWS_FALLBACK_MAX_QUERIES`
+and `EASYNEWS_FALLBACK_BUDGET_SECONDS`. Because the backup runs *after* the primary,
+a 0-result query's total time can approach `SEARCH_BUDGET_SECONDS` + the fallback
+budget — keep NZBHydra's timeout above the sum if you enable it. Separately,
+`EASYNEWS_EXTRA_TERMS_FALLBACK_ONLY` defers `EXTRA_TERMS` into this same 0-result
+stage instead of firing them on every search.
 
 **Language/codec metadata.** `subs`/`language`/`video`/`audio` attrs are populated
 from Easynews's named JSON fields (`subtitle_tracks`/`slangs`, `audio_tracks`/`alangs`,

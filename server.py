@@ -6,6 +6,8 @@ import random
 import re
 import threading
 import time
+import unicodedata
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
@@ -184,6 +186,25 @@ def _transliterate_norwegian(text: str) -> str:
 META_SUBS = _env_bool("EASYNEWS_META_SUBS", True)
 META_AUDIO = _env_bool("EASYNEWS_META_AUDIO", True)
 META_CODECS = _env_bool("EASYNEWS_META_CODECS", True)
+# Emit the video bitrate (from Easynews's raw `bps`, formatted as "12.72 Mbps").
+# More precise than Easynews's own `prettyBps`, which rounds to whole Mbps.
+META_BITRATE = _env_bool("EASYNEWS_META_BITRATE", True)
+# Emit the Usenet group(s) (newznab "group" attr) and the password flag
+# (newznab "password" attr, "1"/"0"). Both come straight from the JSON.
+META_GROUP = _env_bool("EASYNEWS_META_GROUP", True)
+META_PASSWORD = _env_bool("EASYNEWS_META_PASSWORD", True)
+
+
+def _format_bitrate_mbps(raw: Any) -> Optional[str]:
+    """Easynews's `bps` (raw bits/sec) → "12.72 Mbps" (2 decimals). Returns None
+    for missing/zero values (some posts report bps=0)."""
+    try:
+        bps = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if bps <= 0:
+        return None
+    return f"{bps / 1_000_000:.2f} Mbps"
 
 # Extra search terms (comma-separated). For each one, the bridge also runs
 # "<query> <term>" alongside the bare query and merges the results. Easynews
@@ -211,6 +232,176 @@ def _parse_langs_csv(value: Optional[str]) -> List[str]:
 # matching subtitle track, so it's strict — releases whose subs Easynews didn't
 # index are dropped. Pairs well with EASYNEWS_EXTRA_TERMS=nordic.
 REQUIRE_SUBS = _parse_langs_csv(os.environ.get("EASYNEWS_REQUIRE_SUBS"))
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+# ── (#4) Search-result cache ────────────────────────────────────────────────
+# Prowlarr/Sonarr/Radarr poll the indexer with the same queries constantly (RSS
+# sync, re-runs, multiple apps). We only cached the *login* before, so every
+# search hit Easynews. This caches the final mapped+filtered item list per
+# distinct query for a short TTL, so repeats return instantly and don't spend an
+# Easynews request. Single worker / shared threads (gunicorn -w1 --threads N), so
+# a plain module-level dict is shared across all request threads.
+# TTL is deliberately SHORT for an indexer: too long and a just-posted release is
+# invisible until it expires. 0 = caching off (unchanged behaviour).
+CACHE_TTL_SECONDS = _env_int("EASYNEWS_CACHE_TTL_SECONDS", 0)
+CACHE_MAX_ENTRIES = _env_int("EASYNEWS_CACHE_MAX_ENTRIES", 512)
+_SEARCH_CACHE: "OrderedDict[str, tuple[float, List[dict]]]" = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key: str) -> Optional[List[dict]]:
+    if CACHE_TTL_SECONDS <= 0:
+        return None
+    with _CACHE_LOCK:
+        hit = _SEARCH_CACHE.get(key)
+        if hit is None:
+            return None
+        ts, items = hit
+        if time.time() - ts > CACHE_TTL_SECONDS:
+            _SEARCH_CACHE.pop(key, None)
+            return None
+        _SEARCH_CACHE.move_to_end(key)  # mark most-recently-used
+        return items
+
+
+def _cache_put(key: str, items: List[dict]) -> None:
+    if CACHE_TTL_SECONDS <= 0:
+        return
+    with _CACHE_LOCK:
+        _SEARCH_CACHE[key] = (time.time(), items)
+        _SEARCH_CACHE.move_to_end(key)
+        while len(_SEARCH_CACHE) > CACHE_MAX_ENTRIES:
+            _SEARCH_CACHE.popitem(last=False)  # evict oldest (LRU)
+
+
+# ── (#5/#6) 0-result fallback: spelling variants + alternate titles ─────────
+# When the primary search returns NOTHING, optionally run extra "backup"
+# searches built from (5) alternate ASCII spellings of the title and (6)
+# curated alternate titles. Gated so the extra Easynews requests only fire when
+# they could actually help (a 0-result query), never on a query that already
+# found something — no wasted requests in the common case.
+FALLBACK_SEARCH = _env_bool("EASYNEWS_FALLBACK_SEARCH", False)
+# Include alternate ASCII spellings (Tromsø→Tromsoe/Tromso, Köln→Koeln/Koln/Cologne…).
+FALLBACK_TRANSLITERATE = _env_bool("EASYNEWS_FALLBACK_TRANSLITERATE", True)
+# Include curated aliases from the custom-titles file (Walking Dead→The Walking Dead…).
+FALLBACK_ALT_TITLES = _env_bool("EASYNEWS_FALLBACK_ALT_TITLES", True)
+# Hard cap on how many backup queries fire (resource guard), and the wall-clock
+# budget for the whole backup stage. Backups run concurrently, single-shot.
+FALLBACK_MAX_QUERIES = _env_int("EASYNEWS_FALLBACK_MAX_QUERIES", 6)
+FALLBACK_BUDGET_SECONDS = _env_float("EASYNEWS_FALLBACK_BUDGET_SECONDS", 4.0)
+# Run EASYNEWS_EXTRA_TERMS only as part of the 0-result fallback, instead of
+# alongside every search. Saves the per-search extra requests when the bare
+# query already returns results. Default off = current always-on behaviour.
+EXTRA_TERMS_FALLBACK_ONLY = _env_bool("EASYNEWS_EXTRA_TERMS_FALLBACK_ONLY", False)
+
+# Curated alternate-title map (canonical title -> [aliases]). JSON file, same
+# format as the upstream easynews-plus-plus custom-titles.json. Loaded once at
+# start; missing/empty file = feature simply contributes nothing.
+CUSTOM_TITLES_FILE = os.environ.get("EASYNEWS_CUSTOM_TITLES_FILE", "custom-titles.json").strip()
+
+
+def _load_custom_titles(path: str) -> Dict[str, List[str]]:
+    if not path:
+        return {}
+    try:
+        candidate = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+        if not os.path.exists(candidate):
+            return {}
+        with open(candidate, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        out: Dict[str, List[str]] = {}
+        for key, vals in (raw or {}).items():
+            if str(key).startswith("_"):
+                continue  # allow "_comment" style notes in the file
+            if isinstance(vals, str):
+                vals = [vals]
+            if isinstance(vals, list):
+                out[str(key)] = [str(v) for v in vals if str(v).strip()]
+        if out:
+            logger.info("Loaded %d custom-title mapping(s) from %s", len(out), candidate)
+        return out
+    except Exception as exc:  # noqa: BLE001 — bad file shouldn't crash the server
+        logger.warning("Could not load custom titles from %r: %s", path, exc)
+        return {}
+
+
+CUSTOM_TITLES = _load_custom_titles(CUSTOM_TITLES_FILE)
+
+# Multi-convention transliteration maps for the spelling-variant generator. Each
+# whole-string convention yields at most one variant, so a foreign title gives a
+# small, bounded set (≤3) and an already-ASCII title gives ZERO (no wasted query).
+_VAR_DIGRAPH = {
+    ord("æ"): "ae", ord("Æ"): "Ae", ord("ø"): "oe", ord("Ø"): "Oe",
+    ord("å"): "aa", ord("Å"): "Aa", ord("ä"): "ae", ord("Ä"): "Ae",
+    ord("ö"): "oe", ord("Ö"): "Oe", ord("ü"): "ue", ord("Ü"): "Ue",
+    ord("ß"): "ss",
+}
+_VAR_BAREVOWEL = {
+    ord("æ"): "ae", ord("Æ"): "Ae", ord("ø"): "o", ord("Ø"): "O",
+    ord("å"): "a", ord("Å"): "A", ord("ä"): "a", ord("Ä"): "A",
+    ord("ö"): "o", ord("Ö"): "O", ord("ü"): "u", ord("Ü"): "U",
+    ord("ß"): "ss",
+}
+_VAR_PRESTRIP = {  # letters NFKD won't decompose; map before stripping accents
+    ord("ø"): "o", ord("Ø"): "O", ord("å"): "a", ord("Å"): "A",
+    ord("æ"): "ae", ord("Æ"): "Ae", ord("ß"): "ss", ord("đ"): "d", ord("Đ"): "D",
+    ord("ł"): "l", ord("Ł"): "L",
+}
+
+
+def _strip_accents(text: str) -> str:
+    """Fold any accented/diacritic title to plain ASCII (José→Jose, Köln→Koln,
+    Tromsø→Tromso). Handles the non-decomposing Nordic/Slavic letters explicitly,
+    then NFKD-strips the rest."""
+    pre = text.translate(_VAR_PRESTRIP)
+    nfkd = unicodedata.normalize("NFKD", pre)
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
+def _spelling_variants(title: str) -> List[str]:
+    """Up to three alternate ASCII spellings of a title, in the conventions
+    releases actually use: digraph (ø→oe, ü→ue), bare-vowel (ø→o, ü→u), and a
+    full accent-strip. Empty for an already-ASCII title (so no backup query is
+    wasted on titles that don't need one)."""
+    if not title:
+        return []
+    out: List[str] = []
+    for conv in (title.translate(_VAR_DIGRAPH), title.translate(_VAR_BAREVOWEL), _strip_accents(title)):
+        conv = conv.strip()
+        if conv and conv != title and conv not in out:
+            out.append(conv)
+    return out
+
+
+def _alternative_titles(title: str) -> List[str]:
+    """Curated aliases for a title from CUSTOM_TITLES — direct key match plus
+    substring match in either direction (so 'Walking Dead' picks up 'The Walking
+    Dead'). Returns aliases only (never the input itself)."""
+    if not title or not CUSTOM_TITLES:
+        return []
+    out: List[str] = []
+    low = title.lower()
+    for key, vals in CUSTOM_TITLES.items():
+        kl = key.lower()
+        if kl == low or kl in low or low in kl:
+            for v in vals:
+                if v and v.lower() != low and v not in out:
+                    out.append(v)
+    return out
 
 
 def _join_langs(value: Any) -> Optional[str]:
@@ -469,7 +660,12 @@ _ALLOWED_VIDEO_EXTENSIONS = {
 
 _STOPWORDS = {"the", "a", "an", "and", "of", "in", "for", "on"}
 
-_MIN_DURATION_SECONDS = 60
+# (#8) Minimum real-video duration. Easynews is full of short preview/sample
+# clips — many run 2–5 minutes and sail past a 60s floor, showing up as junk
+# "releases" a downstream client may grab and then fail on. Raise this (e.g. 360
+# = 6 minutes, matching the upstream addon) to cut clip noise. Lower it only if
+# you legitimately index very short content (music videos, shorts). (default: 60)
+_MIN_DURATION_SECONDS = _env_int("EASYNEWS_MIN_DURATION_SECONDS", 60)
 # Split on underscores too ([\W_] = anything that isn't a letter/digit). Fansub
 # groups (HorribleSubs, Coalgirls, Erai-raws, SubsPlease) join words with "_",
 # e.g. "[Coalgirls]_Occult_Academy_03_..."; without this the whole name becomes
@@ -835,6 +1031,9 @@ def filter_and_map(
         audio_langs: Any = None
         vcodec: Any = None
         acodec: Any = None
+        bitrate_raw: Any = None
+        group_raw: Any = None
+        passwd_flag: bool = False
 
         if isinstance(it, list):
             if len(it) >= 12:
@@ -874,6 +1073,19 @@ def filter_and_map(
             )
             vcodec = it.get("vcodec") or it.get("video_codec")
             acodec = it.get("acodec") or it.get("audio_codec")
+            bitrate_raw = it.get("bps")
+            group_raw = it.get("groups")
+            passwd_flag = bool(it.get("password") or it.get("passwd"))
+            # `yres` is Easynews's probed vertical resolution (e.g. 1080) — a
+            # reliable height even when the filename omits "1080p". Feed it as the
+            # quality fallback so quality/category detection isn't title-only.
+            if not fullres:
+                yres = it.get("yres") or it.get("height")
+                try:
+                    if yres and int(yres) > 0:
+                        fullres = f"{int(yres)}p"
+                except (TypeError, ValueError):
+                    pass
 
         if not hash_id or not ext:
             continue
@@ -995,6 +1207,9 @@ def filter_and_map(
             "audio_langs": _join_langs(audio_langs),
             "vcodec": (str(vcodec).strip() or None) if vcodec else None,
             "acodec": (str(acodec).strip() or None) if acodec else None,
+            "bitrate": _format_bitrate_mbps(bitrate_raw),
+            "group": (str(group_raw).strip() or None) if group_raw else None,
+            "password": passwd_flag,
         }
 
         if DEDUP_KEEP_NEWEST:
@@ -1008,6 +1223,131 @@ def filter_and_map(
 
         out.append(item)
     return out
+
+
+def _search_and_filter(
+    c: EasynewsClient,
+    raw: str,
+    *,
+    query_meta: Dict[str, Optional[Any]],
+    min_bytes: int,
+    require_subs: Optional[List[str]],
+    strict_requested: bool,
+    single_shot: bool = False,
+) -> List[dict]:
+    """Run one Easynews search for *raw* and return mapped+filtered items.
+
+    The token/strict-phrase filter context is built FROM *raw* itself, so an
+    alternate spelling/title is matched against the thing we actually searched
+    for (not the user's original query). season/episode/year still come from the
+    shared *query_meta*. ``single_shot`` uses one bounded request (for the
+    concurrent fallback fan-out) instead of the full hedged search.
+    """
+    search_q = _clean_search_query(raw)
+    if STRIP_STOPWORDS:
+        search_q = _strip_search_stopwords(search_q)
+    if TRANSLITERATE_NORWEGIAN:
+        search_q = _transliterate_norwegian(search_q)
+    if not search_q:
+        return []
+    tokens = [t for t in _tokenize(raw) if not _SEASON_TOKEN_RE.match(t)]
+    phrase = _sanitize_phrase(raw) if strict_requested else None
+    if single_shot:
+        try:
+            data = c._search_once(
+                search_q, "VIDEO", 1, 250, "relevance", "-",
+                0, timeout=FALLBACK_BUDGET_SECONDS, nonce=random.random(),
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed backup is harmless
+            logger.debug("Fallback query %r failed: %s", search_q, exc)
+            return []
+    else:
+        data = c.search_hedged(
+            query=search_q, file_type="VIDEO", per_page=250,
+            sort_field="relevance", sort_dir="-",
+        )
+    return filter_and_map(
+        data, min_bytes=min_bytes, query_tokens=tokens, query_meta=query_meta,
+        strict_phrase=phrase, strict_match=strict_requested, require_subs=require_subs,
+    )
+
+
+def _run_fallback_search(
+    c: EasynewsClient,
+    title: str,
+    suffix: str,
+    *,
+    query_meta: Dict[str, Optional[Any]],
+    min_bytes: int,
+    require_subs: Optional[List[str]],
+    strict_requested: bool,
+    extra_terms: Optional[List[str]] = None,
+) -> List[dict]:
+    """0-result backup stage (#5/#6). Builds candidate queries from alternate
+    spellings + curated alternate titles (+ optional extra terms), runs them
+    concurrently (bounded), and returns the merged, hash-deduped items. Only
+    called when the primary search found nothing, so it costs zero in the common
+    case."""
+    candidates: List[str] = []
+
+    def _add(t: str) -> None:
+        cand = " ".join(p for p in (t, suffix) if p).strip()
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    # Spelling/alias candidates only when the full fallback is enabled. When only
+    # EXTRA_TERMS_FALLBACK_ONLY is on, the fan-out is the extra terms alone.
+    if FALLBACK_SEARCH and FALLBACK_TRANSLITERATE:
+        for v in _spelling_variants(title):
+            _add(v)
+    if FALLBACK_SEARCH and FALLBACK_ALT_TITLES:
+        for alt in _alternative_titles(title):
+            _add(alt)
+            for v in _spelling_variants(alt):  # comprehensive: also fold the aliases
+                _add(v)
+    for term in (extra_terms or []):
+        base = " ".join(p for p in (title, suffix) if p).strip()
+        if base:
+            cand = f"{base} {term}".strip()
+            if cand not in candidates:
+                candidates.append(cand)
+
+    if not candidates:
+        return []
+    candidates = candidates[:FALLBACK_MAX_QUERIES]
+    logger.info("Fallback search: 0 primary results, trying %d backup query/ies: %s",
+                len(candidates), "; ".join(candidates))
+
+    merged: List[dict] = []
+    seen: Set[str] = set()
+    lock = threading.Lock()
+
+    def _run(cq: str) -> None:
+        items = _search_and_filter(
+            c, cq, query_meta=query_meta, min_bytes=min_bytes,
+            require_subs=require_subs, strict_requested=strict_requested,
+            single_shot=True,
+        )
+        if not items:
+            return
+        with lock:
+            for it in items:
+                h = it.get("hash")
+                if h and h not in seen:
+                    seen.add(h)
+                    merged.append(it)
+
+    threads = [
+        threading.Thread(target=_run, args=(cq,), name=f"ez-fallback-{i}", daemon=True)
+        for i, cq in enumerate(candidates)
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=FALLBACK_BUDGET_SECONDS + 1.0)
+    if merged:
+        logger.info("Fallback search recovered %d result(s).", len(merged))
+    return merged
 
 
 @APP.route("/api")
@@ -1203,97 +1543,116 @@ def api():
         else:
             c = client()
             search_start = time.time()
-            # Sanitise the outbound query so a client quirk like "Avengers
-            # --1080p" doesn't become a broken/slow Easynews query, and drop
-            # connector stopwords so an expanded title ("…Escha and Logy…")
-            # doesn't zero out the search against a release named "…Escha..Logy…".
-            # Filtering still uses the raw query (query_tokens/strict_phrase).
-            search_q = _clean_search_query(q)
-            if STRIP_STOPWORDS:
-                search_q = _strip_search_stopwords(search_q)
-                
-            # Fold Norwegian letters so we ask Easynews for the ASCII-folded form
-            # releases are actually posted under (a "Trøst" search → "Troest").
-            # The title filters fold the same way, so matching stays consistent.
-            if TRANSLITERATE_NORWEGIAN:
-                search_q = _transliterate_norwegian(search_q)
+            # (#4) Serve repeated queries from the short-TTL result cache —
+            # Prowlarr/Sonarr/Radarr poll constantly. Key on everything that
+            # changes the output; offset/limit are sliced AFTER, so paging the
+            # same search reuses one entry.
+            cache_key = json.dumps(
+                {"q": q, "min": min_bytes, "strict": strict_requested,
+                 "subs": sorted(require_subs or [])},
+                sort_keys=True, ensure_ascii=False,
+            )
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                items = cached
+                logger.info("Search %r served from cache → %d item(s)", q, len(items))
+            else:
+                # Sanitise the outbound query (a client quirk like "Avengers
+                # --1080p" shouldn't become a broken Easynews query) and drop
+                # connector stopwords; filtering still uses the raw query.
+                search_q = _clean_search_query(q)
+                if STRIP_STOPWORDS:
+                    search_q = _strip_search_stopwords(search_q)
+                # Fold Norwegian letters so we ask Easynews for the ASCII form
+                # releases are posted under (a "Trøst" search → "Troest").
+                if TRANSLITERATE_NORWEGIAN:
+                    search_q = _transliterate_norwegian(search_q)
 
-            # Kick off the extra-term searches (EASYNEWS_EXTRA_TERMS) CONCURRENTLY
-            # with the bare search, so a slow query doesn't pay for them serially
-            # (was bare-budget + term-timeouts ≈ 6s; now ≈ max of the two).
-            aug_holder: Dict[str, List[Any]] = {"rows": []}
-            aug_thread: Optional[threading.Thread] = None
-            if EXTRA_TERMS and search_q:
-                aug_queries = [f"{search_q} {term}".strip() for term in EXTRA_TERMS]
+                # Extra-term searches (EASYNEWS_EXTRA_TERMS) run CONCURRENTLY with
+                # the bare query — unless deferred to the 0-result fallback via
+                # EASYNEWS_EXTRA_TERMS_FALLBACK_ONLY.
+                aug_holder: Dict[str, List[Any]] = {"rows": []}
+                aug_thread: Optional[threading.Thread] = None
+                if EXTRA_TERMS and search_q and not EXTRA_TERMS_FALLBACK_ONLY:
+                    aug_queries = [f"{search_q} {term}".strip() for term in EXTRA_TERMS]
 
-                def _run_aug() -> None:
-                    aug_holder["rows"] = c.search_queries(
-                        aug_queries, file_type="VIDEO", per_page=250,
-                        sort_field="relevance", sort_dir="-",
+                    def _run_aug() -> None:
+                        aug_holder["rows"] = c.search_queries(
+                            aug_queries, file_type="VIDEO", per_page=250,
+                            sort_field="relevance", sort_dir="-",
+                        )
+
+                    aug_thread = threading.Thread(
+                        target=_run_aug, name="ez-extra-terms", daemon=True
                     )
+                    aug_thread.start()
 
-                aug_thread = threading.Thread(
-                    target=_run_aug, name="ez-extra-terms", daemon=True
+                # Latency-bounded, hedged search: first real results, hard-capped
+                # under NZBHydra's timeout so a slow Easynews != "0 results".
+                data = c.search_hedged(
+                    query=search_q, file_type="VIDEO", per_page=250,
+                    sort_field="relevance", sort_dir="-",
                 )
-                aug_thread.start()
+                # Optional extra pages (EASYNEWS_PAGINATE); respects numPages so a
+                # single-page query costs zero extra calls.
+                if paginate_enabled() and data.get("data"):
+                    try:
+                        total_pages = int(data.get("numPages") or 1)
+                    except (TypeError, ValueError):
+                        total_pages = 1
+                    pages_wanted = min(max_pages(), max(total_pages, 1))
+                    if pages_wanted > 1:
+                        extra_rows = c.fetch_more_pages(
+                            search_q, file_type="VIDEO", per_page=250,
+                            sort_field="relevance", sort_dir="-",
+                            start_page=2, max_pages=pages_wanted,
+                        )
+                        if extra_rows:
+                            data = {**data, "data": list(data.get("data") or []) + extra_rows}
+                # Merge the concurrent extra-term rows (prepended so they survive
+                # the limit cut; same filtering still drops off-target shows).
+                if aug_thread is not None:
+                    aug_thread.join(timeout=_SEARCH_ATTEMPT_TIMEOUT + 1.0)
+                    aug_rows = aug_holder.get("rows") or []
+                    if aug_rows:
+                        data = {**data, "data": list(aug_rows) + list(data.get("data") or [])}
+                        logger.info(
+                            "Extra-term search added %d row(s) from term(s): %s",
+                            len(aug_rows), ", ".join(EXTRA_TERMS),
+                        )
+                raw_count = len(data.get("data", []))
+                items = filter_and_map(
+                    data, min_bytes=min_bytes, query_tokens=query_tokens,
+                    query_meta=query_meta, strict_phrase=strict_phrase,
+                    strict_match=strict_requested, require_subs=require_subs,
+                )
+                subs_note = f", subs={'+'.join(require_subs)}" if require_subs else ""
+                logger.info(
+                    "Search %r [%s%s] → %d raw results, %d passed filters, in %.1fs",
+                    q, _active_endpoint_label(), subs_note, raw_count, len(items),
+                    time.time() - search_start,
+                )
 
-            # Latency-bounded, hedged search: returns the first real results and
-            # is hard-capped well under NZBHydra's 4s timeout, so a slow/hung
-            # Easynews response no longer surfaces as "0 results".
-            data = c.search_hedged(
-                query=search_q,
-                file_type="VIDEO",
-                per_page=250,
-                sort_field="relevance",
-                sort_dir="-",
-            )
-            # Optional extra pages (EASYNEWS_PAGINATE). Off by default; adds
-            # latency, so only worth it when you've raised the search budget.
-            # Respect the response's numPages: never fetch pages that don't
-            # exist, so a single-page query costs zero extra calls even with a
-            # high EASYNEWS_MAX_PAGES.
-            if paginate_enabled() and data.get("data"):
-                try:
-                    total_pages = int(data.get("numPages") or 1)
-                except (TypeError, ValueError):
-                    total_pages = 1
-                pages_wanted = min(max_pages(), max(total_pages, 1))
-                if pages_wanted > 1:
-                    extra_rows = c.fetch_more_pages(
-                        search_q, file_type="VIDEO", per_page=250,
-                        sort_field="relevance", sort_dir="-",
-                        start_page=2, max_pages=pages_wanted,
+                # (#5/#6) 0-result fallback — only when the primary found nothing,
+                # so the extra Easynews requests never fire on a query that already
+                # returned results.
+                want_fallback = FALLBACK_SEARCH or (EXTRA_TERMS_FALLBACK_ONLY and bool(EXTRA_TERMS))
+                fb_title = base_query
+                fb_suffix = (
+                    " ".join(search_components[1:]).strip()
+                    if len(search_components) > 1 else ""
+                )
+                if not items and want_fallback and fb_title:
+                    fb_extra = EXTRA_TERMS if (EXTRA_TERMS_FALLBACK_ONLY and EXTRA_TERMS) else None
+                    fb_items = _run_fallback_search(
+                        c, fb_title, fb_suffix, query_meta=query_meta,
+                        min_bytes=min_bytes, require_subs=require_subs,
+                        strict_requested=strict_requested, extra_terms=fb_extra,
                     )
-                    if extra_rows:
-                        data = {**data, "data": list(data.get("data") or []) + extra_rows}
-            # Merge the concurrently-fetched extra-term rows. Prepended so the
-            # targeted matches survive the client's limit cut; same downstream
-            # filtering applies, so off-target shows are still dropped.
-            if aug_thread is not None:
-                aug_thread.join(timeout=_SEARCH_ATTEMPT_TIMEOUT + 1.0)
-                aug_rows = aug_holder.get("rows") or []
-                if aug_rows:
-                    data = {**data, "data": list(aug_rows) + list(data.get("data") or [])}
-                    logger.info(
-                        "Extra-term search added %d row(s) from term(s): %s",
-                        len(aug_rows), ", ".join(EXTRA_TERMS),
-                    )
-            elapsed = time.time() - search_start
-            raw_count = len(data.get("data", []))
-            items = filter_and_map(
-                data,
-                min_bytes=min_bytes,
-                query_tokens=query_tokens,
-                query_meta=query_meta,
-                strict_phrase=strict_phrase,
-                strict_match=strict_requested,
-                require_subs=require_subs,
-            )
-            subs_note = f", subs={'+'.join(require_subs)}" if require_subs else ""
-            logger.info(
-                "Search %r [%s%s] → %d raw results, %d passed filters, in %.1fs",
-                q, _active_endpoint_label(), subs_note, raw_count, len(items), elapsed,
-            )
+                    if fb_items:
+                        items = fb_items
+
+                _cache_put(cache_key, items)
 
         items = items[offset : offset + limit]
 
@@ -1371,6 +1730,12 @@ def api():
                 attr_parts.append(f'<newznab:attr name="video" value="{xml_escape(it["vcodec"])}"/>')
             if META_CODECS and it.get("acodec"):
                 attr_parts.append(f'<newznab:attr name="audio" value="{xml_escape(it["acodec"])}"/>')
+            if META_BITRATE and it.get("bitrate"):
+                attr_parts.append(f'<newznab:attr name="bitrate" value="{xml_escape(it["bitrate"])}"/>')
+            if META_GROUP and it.get("group"):
+                attr_parts.append(f'<newznab:attr name="group" value="{xml_escape(it["group"])}"/>')
+            if META_PASSWORD:
+                attr_parts.append(f'<newznab:attr name="password" value="{"1" if it.get("password") else "0"}"/>')
             attr_xml = "".join(attr_parts)
             item_xml = (
                 f"<item>"
