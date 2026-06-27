@@ -689,7 +689,16 @@ class EasynewsClient:
                 "Search %r hit the %.1fs budget after %d attempt(s); returning best effort.",
                 query, budget, started,
             )
-        return last_empty if last_empty is not None else {"data": []}
+        # Reaching here means NO attempt returned a clean response — every attempt
+        # errored/timed out (or, with TRUST_EMPTY off, kept coming back empty).
+        # This is a DEGRADED result, not a confirmed "0 results": Easynews was
+        # slow/throttling, so the content may well exist. Mark it so the caller
+        # can refuse to cache it (caching a false-empty would hide real results
+        # for the whole TTL). A genuine fast empty returns earlier, unmarked.
+        result = last_empty if last_empty is not None else {"data": []}
+        if isinstance(result, dict):
+            result = {**result, "_incomplete": True}
+        return result
 
     def fetch_more_pages(
         self,
@@ -745,16 +754,22 @@ class EasynewsClient:
         sort_field: Optional[str] = "relevance",
         sort_dir: str = "-",
         attempt_timeout: float = _SEARCH_ATTEMPT_TIMEOUT,
-    ) -> List[Any]:
+    ) -> tuple[List[Any], bool]:
         """Run several queries concurrently (one shot each) and return their
-        merged raw rows. Used for EASYNEWS_EXTRA_TERMS — e.g. firing the bare
-        query plus "<query> nordic"/"<query> danish" so language-tagged releases
-        that the bare relevance ranking buries deep show up on page 1. The caller
-        merges + dedups (filter_and_map dedups by hash)."""
+        merged raw rows PLUS a `degraded` flag. Used for EASYNEWS_EXTRA_TERMS —
+        e.g. firing the bare query plus "<query> nordic"/"<query> danish" so
+        language-tagged releases that the bare relevance ranking buries deep show
+        up on page 1. The caller merges + dedups (filter_and_map dedups by hash).
+
+        `degraded` is True if ANY query errored/timed out (e.g. a 429): the merge
+        is then incomplete, so the caller must not cache a resulting empty — those
+        extra-term queries are often the only way the subtitle-filtered releases
+        surface, so a failed one can masquerade as a real 0."""
         out: List[Any] = []
         if not queries:
-            return out
+            return out, False
         lock = threading.Lock()
+        status = {"degraded": False}
 
         def _run(query: str) -> None:
             try:
@@ -767,6 +782,8 @@ class EasynewsClient:
                     out.extend(rows)
             except Exception as exc:  # noqa: BLE001 - best-effort supplementary search
                 logger.warning("Extra-term search %r failed: %s", query, _plain_error(exc))
+                with lock:
+                    status["degraded"] = True
 
         threads = [
             threading.Thread(target=_run, args=(qq,), name=f"ez-term-{i}", daemon=True)
@@ -776,7 +793,7 @@ class EasynewsClient:
             t.start()
         for t in threads:
             t.join(timeout=attempt_timeout + 1.0)
-        return out
+        return out, status["degraded"]
 
     @staticmethod
     def _collect_items(json_data: Dict[str, Any]) -> List[SearchItem]:

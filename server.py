@@ -1234,6 +1234,7 @@ def _search_and_filter(
     require_subs: Optional[List[str]],
     strict_requested: bool,
     single_shot: bool = False,
+    status: Optional[Dict[str, bool]] = None,
 ) -> List[dict]:
     """Run one Easynews search for *raw* and return mapped+filtered items.
 
@@ -1241,7 +1242,9 @@ def _search_and_filter(
     alternate spelling/title is matched against the thing we actually searched
     for (not the user's original query). season/episode/year still come from the
     shared *query_meta*. ``single_shot`` uses one bounded request (for the
-    concurrent fallback fan-out) instead of the full hedged search.
+    concurrent fallback fan-out) instead of the full hedged search. If *status*
+    is given, a degraded single-shot request sets ``status['degraded']`` so the
+    caller can refuse to cache a resulting false empty.
     """
     search_q = _clean_search_query(raw)
     if STRIP_STOPWORDS:
@@ -1260,6 +1263,8 @@ def _search_and_filter(
             )
         except Exception as exc:  # noqa: BLE001 — a failed backup is harmless
             logger.debug("Fallback query %r failed: %s", search_q, exc)
+            if status is not None:
+                status["degraded"] = True
             return []
     else:
         data = c.search_hedged(
@@ -1282,12 +1287,13 @@ def _run_fallback_search(
     require_subs: Optional[List[str]],
     strict_requested: bool,
     extra_terms: Optional[List[str]] = None,
-) -> List[dict]:
+) -> "tuple[List[dict], bool]":
     """0-result backup stage (#5/#6). Builds candidate queries from alternate
     spellings + curated alternate titles (+ optional extra terms), runs them
-    concurrently (bounded), and returns the merged, hash-deduped items. Only
-    called when the primary search found nothing, so it costs zero in the common
-    case."""
+    concurrently (bounded), and returns the merged, hash-deduped items plus a
+    `degraded` flag (True if any backup query errored/429'd, so the caller won't
+    cache a resulting empty). Only called when the primary search found nothing,
+    so it costs zero in the common case."""
     candidates: List[str] = []
 
     def _add(t: str) -> None:
@@ -1313,7 +1319,7 @@ def _run_fallback_search(
                 candidates.append(cand)
 
     if not candidates:
-        return []
+        return [], False
     candidates = candidates[:FALLBACK_MAX_QUERIES]
     logger.info("Fallback search: 0 primary results, trying %d backup query/ies: %s",
                 len(candidates), "; ".join(candidates))
@@ -1321,12 +1327,13 @@ def _run_fallback_search(
     merged: List[dict] = []
     seen: Set[str] = set()
     lock = threading.Lock()
+    status: Dict[str, bool] = {"degraded": False}
 
     def _run(cq: str) -> None:
         items = _search_and_filter(
             c, cq, query_meta=query_meta, min_bytes=min_bytes,
             require_subs=require_subs, strict_requested=strict_requested,
-            single_shot=True,
+            single_shot=True, status=status,
         )
         if not items:
             return
@@ -1347,7 +1354,7 @@ def _run_fallback_search(
         th.join(timeout=FALLBACK_BUDGET_SECONDS + 1.0)
     if merged:
         logger.info("Fallback search recovered %d result(s).", len(merged))
-    return merged
+    return merged, status["degraded"]
 
 
 @APP.route("/api")
@@ -1571,16 +1578,18 @@ def api():
                 # Extra-term searches (EASYNEWS_EXTRA_TERMS) run CONCURRENTLY with
                 # the bare query — unless deferred to the 0-result fallback via
                 # EASYNEWS_EXTRA_TERMS_FALLBACK_ONLY.
-                aug_holder: Dict[str, List[Any]] = {"rows": []}
+                aug_holder: Dict[str, Any] = {"rows": [], "degraded": False}
                 aug_thread: Optional[threading.Thread] = None
                 if EXTRA_TERMS and search_q and not EXTRA_TERMS_FALLBACK_ONLY:
                     aug_queries = [f"{search_q} {term}".strip() for term in EXTRA_TERMS]
 
                     def _run_aug() -> None:
-                        aug_holder["rows"] = c.search_queries(
+                        rows, degraded = c.search_queries(
                             aug_queries, file_type="VIDEO", per_page=250,
                             sort_field="relevance", sort_dir="-",
                         )
+                        aug_holder["rows"] = rows
+                        aug_holder["degraded"] = degraded
 
                     aug_thread = threading.Thread(
                         target=_run_aug, name="ez-extra-terms", daemon=True
@@ -1621,6 +1630,18 @@ def api():
                             len(aug_rows), ", ".join(EXTRA_TERMS),
                         )
                 raw_count = len(data.get("data", []))
+                # A degraded search (budget hit / all attempts errored / throttled)
+                # is NOT a confirmed "0 results" — caching its empty would hide real
+                # results for the whole TTL (the bug where a slow/429'd query poisons
+                # the cache with a false negative). Only genuine, complete responses
+                # (including a fast genuine empty) are cacheable.
+                # Degraded if the main hedged search degraded OR any extra-term
+                # query errored/429'd (those often surface the subtitle-filtered
+                # releases, so a failed one can fake a 0 once require_subs prunes
+                # the rest). Either way, don't persist the result.
+                search_incomplete = bool(data.get("_incomplete")) or bool(
+                    aug_holder.get("degraded")
+                )
                 items = filter_and_map(
                     data, min_bytes=min_bytes, query_tokens=query_tokens,
                     query_meta=query_meta, strict_phrase=strict_phrase,
@@ -1644,15 +1665,28 @@ def api():
                 )
                 if not items and want_fallback and fb_title:
                     fb_extra = EXTRA_TERMS if (EXTRA_TERMS_FALLBACK_ONLY and EXTRA_TERMS) else None
-                    fb_items = _run_fallback_search(
+                    fb_items, fb_degraded = _run_fallback_search(
                         c, fb_title, fb_suffix, query_meta=query_meta,
                         min_bytes=min_bytes, require_subs=require_subs,
                         strict_requested=strict_requested, extra_terms=fb_extra,
                     )
                     if fb_items:
                         items = fb_items
+                    # A degraded backup that recovered nothing is also a false 0.
+                    if fb_degraded and not fb_items:
+                        search_incomplete = True
 
-                _cache_put(cache_key, items)
+                # Never cache a degraded/best-effort result (it may be a false
+                # empty from a slow or throttled Easynews). A clean response —
+                # whether it has rows or is a genuine empty — is cached as normal.
+                if not search_incomplete:
+                    _cache_put(cache_key, items)
+                elif items:
+                    # Degraded but we still scraped something back — serve it, just
+                    # don't persist it, so the next poll re-checks Easynews.
+                    logger.info("Search %r degraded; serving %d item(s) uncached.", q, len(items))
+                else:
+                    logger.info("Search %r degraded with no data; not caching (will retry).", q)
 
         items = items[offset : offset + limit]
 

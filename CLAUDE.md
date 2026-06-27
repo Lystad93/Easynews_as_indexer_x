@@ -140,8 +140,15 @@ item list, keyed by the effective query + min-size + strict flag + `subs`. Repea
 polls (Prowlarr/Sonarr/Radarr RSS sync, re-runs, multiple apps) are served from
 memory; `offset`/`limit` are sliced *after* the cache so paging one search reuses
 one entry. The single-worker / shared-threads gunicorn setup means a plain dict is
-shared across all request threads. Keep the TTL short — it caches empties too, so a
-long TTL hides a just-posted release until expiry. Default `0` = off.
+shared across all request threads. Keep the TTL short — it caches *genuine* empties
+too (e.g. an unreleased episode), so a long TTL hides a just-posted release until
+expiry. Default `0` = off. **Degraded searches are never cached:** if `search_hedged`
+returns a best-effort result because every attempt errored/timed out or hit the
+budget (Easynews slow or 429-throttling), the payload is tagged `_incomplete` and
+the handler skips `_cache_put`. This prevents a slow/throttled query from poisoning
+the cache with a *false* empty (0 results that hides content which actually exists)
+for the whole TTL — the next poll re-checks Easynews instead. A fast genuine empty
+(clean HTTP 200, 0 rows) is still cached.
 
 **0-result fallback (alternate spellings + titles).** `EASYNEWS_FALLBACK_SEARCH`
 adds a backup stage that runs *only when the primary search returns nothing*, so
