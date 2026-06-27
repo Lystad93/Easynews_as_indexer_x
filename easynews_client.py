@@ -64,10 +64,86 @@ def max_pages() -> int:
     return _MAX_PAGES
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Sorting (env-configurable, multi-level). Easynews ranks by up to three sort
+# keys. By default ONLY the primary key the caller passes is emitted, so
+# behaviour is unchanged unless you set these. Set EASYNEWS_SORT_1 to override
+# the primary field, and SORT_2/SORT_3 to add tie-breakers.
+#   field values: relevance | dsize (size) | dtime (date posted) | dsubject
+#   direction:    "-" = descending (default) | "+" = ascending
+# A good "biggest, then most-relevant, then newest" order is:
+#   EASYNEWS_SORT_1=dsize  EASYNEWS_SORT_2=relevance  EASYNEWS_SORT_3=dtime
+# ──────────────────────────────────────────────────────────────────────────
+_SORT_1 = os.environ.get("EASYNEWS_SORT_1", "").strip()
+_SORT_1_DIR = os.environ.get("EASYNEWS_SORT_1_DIR", "").strip()
+_SORT_2 = os.environ.get("EASYNEWS_SORT_2", "").strip()
+_SORT_2_DIR = os.environ.get("EASYNEWS_SORT_2_DIR", "-").strip() or "-"
+_SORT_3 = os.environ.get("EASYNEWS_SORT_3", "").strip()
+_SORT_3_DIR = os.environ.get("EASYNEWS_SORT_3_DIR", "-").strip() or "-"
+
+# ──────────────────────────────────────────────────────────────────────────
+# Advanced search (env-configurable). When ON, the 2.0 solr endpoint switches
+# to its "/advanced" variant (st=adv), which supports server-side filtering:
+#   spamf  – drop Easynews-flagged spam before it ever reaches our filters
+#   fex    – a file-extension whitelist (only return these video containers)
+# This trims junk upstream (fewer rows to map/dedup) and is what the upstream
+# easynews-plus-plus Stremio addon uses. PROVEN on the 2.0 endpoint. On 3.0 the
+# same params are sent but Easynews may ignore them — hence the toggle, so you
+# can A/B test it against your account (watch the [api 3.0+adv] log line).
+_ADVANCED_SEARCH = os.environ.get("EASYNEWS_ADVANCED_SEARCH", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# Spam filter (advanced only). Defaults ON when advanced search is enabled.
+_SPAM_FILTER = os.environ.get(
+    "EASYNEWS_SPAM_FILTER", "true" if _ADVANCED_SEARCH else "false"
+).strip().lower() in ("1", "true", "yes", "on")
+# File-extension whitelist (advanced only). Comma-separated, no leading dots.
+# Empty = don't send fex (let Easynews return any video container).
+_FILE_EXTENSIONS = os.environ.get(
+    "EASYNEWS_FILE_EXTENSIONS",
+    "m4v,3gp,mov,divx,xvid,wmv,avi,mpg,mpeg,mp4,mkv,avc,flv,webm",
+).strip()
+
+
+def _sort_params(sort_field: Optional[str], sort_dir: str) -> Dict[str, str]:
+    """Build s1/s2/s3 sort params. Env vars override; otherwise the single
+    caller-supplied sort_field/sort_dir is used as the primary key, which keeps
+    the default behaviour identical to before this was configurable."""
+    params: Dict[str, str] = {}
+    s1 = _SORT_1 or (sort_field or "")
+    s1d = _SORT_1_DIR or sort_dir or "-"
+    if s1:
+        params["s1"] = s1
+        params["s1d"] = s1d
+    if _SORT_2:
+        params["s2"] = _SORT_2
+        params["s2d"] = _SORT_2_DIR
+    if _SORT_3:
+        params["s3"] = _SORT_3
+        params["s3d"] = _SORT_3_DIR
+    return params
+
+
+def _apply_advanced(params: Dict[str, str]) -> None:
+    """Add the advanced-search params (st=adv + spam filter + extension
+    whitelist) in place. No-op unless EASYNEWS_ADVANCED_SEARCH is on."""
+    if not _ADVANCED_SEARCH:
+        return
+    params["st"] = "adv"
+    params["gx"] = "1"
+    params["sS"] = "3"
+    if _SPAM_FILTER:
+        params["spamf"] = "1"
+    if _FILE_EXTENSIONS:
+        params["fex"] = _FILE_EXTENSIONS
+
+
 def _active_endpoint_label() -> str:
     if _SEARCH_URL_TEMPLATE:
-        return "custom-template"
-    return f"api {_SEARCH_API}"
+        base = "custom-template"
+    else:
+        base = f"api {_SEARCH_API}"
+    return f"{base}+adv" if _ADVANCED_SEARCH else base
 
 
 def _normalize_response(payload: Any) -> Any:
@@ -383,9 +459,11 @@ class EasynewsClient:
             "safeO": str(safe_off),
             "_nonce": str(nonce if nonce is not None else random.random()),
         }
-        if sort_field:
-            params["s1"] = sort_field
-            params["s1d"] = sort_dir
+        params.update(_sort_params(sort_field, sort_dir))
+        # Advanced params are sent to 3.0 too, but EXPERIMENTALLY — the path is
+        # unchanged (no documented /advanced variant for 3.0); Easynews may
+        # honour or silently ignore st=adv/spamf/fex here. A/B test via the log.
+        _apply_advanced(params)
         url = f"{EASYNEWS_BASE}/3.0/api/search"  # NB: no trailing slash
         query_params = (
             "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
@@ -420,10 +498,14 @@ class EasynewsClient:
             "safeO": str(safe_off),
             "_nonce": str(nonce if nonce is not None else random.random()),  # cache-busting
         }
-        if sort_field:
-            params["s1"] = sort_field
-            params["s1d"] = sort_dir
-        url = f"{EASYNEWS_BASE}/2.0/search/solr-search/"
+        params.update(_sort_params(sort_field, sort_dir))
+        _apply_advanced(params)  # sets st=adv + spamf + fex when enabled
+        # The advanced filters live on the "/advanced" path; basic search keeps
+        # the proven trailing-slash endpoint.
+        if _ADVANCED_SEARCH:
+            url = f"{EASYNEWS_BASE}/2.0/search/solr-search/advanced"
+        else:
+            url = f"{EASYNEWS_BASE}/2.0/search/solr-search/"
         query_params = (
             "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
             + f"&fty%5B%5D={requests.utils.quote(file_type)}"

@@ -85,6 +85,12 @@ See `.env.example` for the full annotated list. Summary:
 | `EASYNEWS_REQUIRE_SUBS` | — | Comma-separated lang codes (e.g. `nor`); keep only releases whose subtitle tracks include one. Per-request override: `&subs=nor` on the `/api` URL |
 | `EASYNEWS_PAGINATE` | `false` | Fetch extra search pages (concurrent, hash-deduped) — adds latency |
 | `EASYNEWS_MAX_PAGES` | `1` | Pages to fetch when `EASYNEWS_PAGINATE` is on |
+| `EASYNEWS_ADVANCED_SEARCH` | `false` | Use the solr `/advanced` endpoint (`st=adv`) so Easynews filters spam (`spamf`) + non-whitelisted extensions (`fex`) server-side. Proven on 2.0; on 3.0 the params are sent but may be ignored (A/B test — log shows `[api 3.0+adv]`) |
+| `EASYNEWS_SPAM_FILTER` | follows advanced | (advanced only) Send `spamf=1` to drop Easynews-flagged spam |
+| `EASYNEWS_FILE_EXTENSIONS` | `m4v,3gp,…,webm` | (advanced only) Video-container whitelist sent as `fex=`; empty = don't send |
+| `EASYNEWS_SORT_1` / `_DIR` | `relevance` / `-` | Primary sort key + direction (`-` desc, `+` asc). Fields: `relevance`, `dsize`, `dtime`, `dsubject` |
+| `EASYNEWS_SORT_2` / `_DIR` | — / `-` | Secondary sort tie-breaker (empty = off) |
+| `EASYNEWS_SORT_3` / `_DIR` | — / `-` | Tertiary sort tie-breaker (empty = off) |
 
 All of the above are read at **container start** (change `.env` → `up -d`, no
 rebuild). Keep this invariant true:
@@ -101,6 +107,19 @@ request from the 3.0 web UI's DevTools and set `EASYNEWS_SEARCH_URL_TEMPLATE` (n
 code change). The NZB **download** path stays on `/2.0/api/dl-nzb` regardless.
 `EASYNEWS_LOG_LATENCY` and the per-search log line (`Search 'x' [api 3.0] → …`)
 are there to compare speed; `easynews_endpoint_benchmark.sh` does an A/B curl test.
+
+**Advanced search + sorting.** `EASYNEWS_ADVANCED_SEARCH=true` flips the 2.0
+endpoint to `/2.0/search/solr-search/advanced` with `st=adv`, enabling
+server-side spam filtering (`spamf`) and a file-extension whitelist (`fex`,
+`EASYNEWS_FILE_EXTENSIONS`) so junk is dropped before our own filters run —
+the same trick the upstream easynews-plus-plus Stremio addon uses. On the 3.0
+api the path is unchanged and the params ride along experimentally (Easynews
+may ignore them); the log line reads `[api 3.0+adv]` so you can A/B test whether
+it actually helps. Sorting is now multi-level and env-driven via
+`EASYNEWS_SORT_1/2/3` (+ `_DIR`); unset = the previous single relevance sort, so
+defaults are unchanged. Both knobs are built entirely in `easynews_client.py`'s
+URL builders, so `server.py` is untouched. Recommended order for an indexer:
+`SORT_1=dsize`, `SORT_2=relevance`, `SORT_3=dtime`.
 
 **Language/codec metadata.** `subs`/`language`/`video`/`audio` attrs are populated
 from Easynews's named JSON fields (`subtitle_tracks`/`slangs`, `audio_tracks`/`alangs`,
