@@ -143,6 +143,42 @@ ALLOW_PASSWORD = _env_bool("EASYNEWS_ALLOW_PASSWORD", False)
 # token set, so precision is unchanged. Default on (it's a recall fix).
 STRIP_STOPWORDS = _env_bool("EASYNEWS_STRIP_STOPWORDS", True)
 
+# Optionally add a direct Easynews HTTPS download URL to each search result.
+# URL format:
+# https://members.easynews.com/dl/auto/443/{hash}{id}{ext}/{filename}{ext}?sid={sid}&sig={sig}
+#
+# When enabled, the URL is exposed as the item's <comments> field so clients
+# that support it (such as Prowlarr) can use it as the release's information
+# link or clickable title.
+INCLUDE_DIRECT_URL = _env_bool("EASYNEWS_INCLUDE_DIRECT_URL", True)
+
+
+def _encode_uri(uri: str) -> str:
+    return quote(uri, safe="")
+
+
+def _build_direct_url(
+    hash_id: Optional[str],
+    item_id: Optional[str],
+    filename_no_ext: Optional[str],
+    ext: Optional[str],
+    sig: Optional[str],
+    sid: Optional[str],
+) -> Optional[str]:
+    """Direct HTTPS download URL, From a 3.0 API response.
+    hash/id/ext/sig/sid all come from the same search
+    response — no separate lookup needed."""
+    if not (hash_id and item_id and sig and sid):
+        return None
+    ext_part = ext or ""
+    if ext_part and not ext_part.startswith("."):
+        ext_part = f".{ext_part}"
+    file_seg = _encode_uri(f"{hash_id}{item_id}{ext_part}")
+    name_seg = _encode_uri(f"{filename_no_ext or hash_id}{ext_part}")
+    url = f"https://members.easynews.com/dl/auto/443/{file_seg}/{name_seg}?sid={_encode_uri(sid)}&sig={_encode_uri(sig)}"
+
+    return url
+
 # Per-title query overrides. Rewrites a specific incoming TITLE to the form a
 # release is actually posted under (e.g. Norsemen -> Vikingane, or fixing an
 # upstream-mangled "ikke lov a le pa hytta" -> "...aa...paa..."). Applied to the
@@ -1020,6 +1056,7 @@ def filter_and_map(
 ) -> List[dict]:
     token_set: Set[str] = set(query_tokens or [])
     thumb_base = json_data.get("thumbURL") or json_data.get("thumbUrl")
+    sid = json_data.get("sid")
     # Loop-invariant: fold the requested subtitle langs once, not per row.
     require_canon: Optional[Set[str]] = _canon_langs(require_subs) if require_subs else None
     out: List[dict] = []
@@ -1045,6 +1082,7 @@ def filter_and_map(
         bitrate_raw: Any = None
         group_raw: Any = None
         passwd_flag: bool = False
+        item_id: Any = None
 
         if isinstance(it, list):
             if len(it) >= 12:
@@ -1060,6 +1098,7 @@ def filter_and_map(
                 duration_raw = it[14]
         elif isinstance(it, dict):
             hash_id = it.get("hash") or it.get("0") or it.get("id")
+            item_id = it.get("id")
             subject = it.get("subject") or it.get("6")
             # `fn` / `extension` / `rawSize` / `runtime` are the named fields the
             # newer 3.0 JSON (and 2.0 dict form) use; the "10"/"11"/"4"/"14"
@@ -1194,6 +1233,11 @@ def filter_and_map(
 
         duration_formatted = _format_duration(duration_seconds)
         thumbnail_url = _build_thumbnail_url(thumb_base, hash_id, filename_no_ext)
+        direct_url = (
+            _build_direct_url(hash_id, item_id, filename_no_ext, ext, sig, sid)
+            if INCLUDE_DIRECT_URL
+            else None
+        )
         year = title_meta.get("year")
 
         item = {
@@ -1201,6 +1245,7 @@ def filter_and_map(
             "filename": filename_no_ext,
             "ext": ext,
             "sig": sig,
+            "direct_url": direct_url,
             "size": size,
             "title": title,
             "poster": poster,
@@ -1739,7 +1784,9 @@ def api():
             link = f"{url_base}/api?t=get&id={enc_id}&apikey={apikey}"
             safe_link = xml_escape(link)
             size = it["size"]
+            direct_url = it.get("direct_url")
             guid = enc_id
+            comments_xml = f"<comments>{xml_escape(direct_url)}</comments>" if direct_url else ""
             poster = it.get("poster")
             posted_dt = _coerce_datetime(it.get("posted")) or now_dt
             posted_str = posted_dt.strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -1803,6 +1850,7 @@ def api():
                 f"<title>{title}</title>"
                 f'<guid isPermaLink="false">{guid}</guid>'
                 f"<link>{safe_link}</link>"
+                f"{comments_xml}"
                 f"<category>{category_id}</category>"
                 f"<pubDate>{posted_str}</pubDate>"
                 f"{attr_xml}"
