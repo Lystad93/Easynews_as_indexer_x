@@ -1,6 +1,8 @@
 name: Build and Push Docker Image
 
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
   release:
@@ -16,7 +18,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The image build alone cannot catch a broken app: the Dockerfile only copies
+  # the source in, so a syntax error still produces a green build and a
+  # container that crashes on start. This job imports the app the way gunicorn
+  # does, and build-and-push waits on it.
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Byte-compile all modules
+        run: python -m compileall -q server.py easynews_client.py query_replace.py
+
+      - name: Import the app the way gunicorn does
+        run: python -c "from server import APP; print('server:APP imported OK')"
+
   build-and-push:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -33,6 +61,7 @@ jobs:
         uses: docker/setup-buildx-action@v3.10.0
 
       - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3.4.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -61,7 +90,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
