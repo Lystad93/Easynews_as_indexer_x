@@ -723,6 +723,22 @@ _SEASON_ONLY_RE = re.compile(
     r"(?:^|[\s\.\-_])s(?P<season>\d{1,2})(?=$|[\s\.\-_])", re.IGNORECASE
 )
 _SEASON_TOKEN_RE = re.compile(r"^s\d{1,2}$", re.IGNORECASE)
+# Additional TV shapes _SEASON_EP_RE deliberately does not cover. Without these
+# every date-based, verbose or bare-episode release fell through to Movies and
+# was dropped by Prowlarr on a tvsearch (which only asks for the 5000 range).
+# Date-based episodes: "2024.01.15", "2024 03 11", "2024-01-15".
+_DATE_EPISODE_RE = re.compile(
+    r"(?<!\d)(?:19|20)\d{2}[\.\-_\s](?:0[1-9]|1[0-2])[\.\-_\s](?:0[1-9]|[12]\d|3[01])(?!\d)"
+)
+# Verbose forms: "Season 2 Episode 5", "Season 2", "Episode 5", "Ep. 5".
+_VERBOSE_SEASON_RE = re.compile(r"season\s*\d{1,2}", re.IGNORECASE)
+_VERBOSE_EPISODE_RE = re.compile(r"(?:episode|ep)\.?\s*\d{1,4}", re.IGNORECASE)
+# Bare episode marker with no season, e.g. "...E05...".
+_BARE_EPISODE_RE = re.compile(
+    r"(?:^|[\s\.\-_])ep?\d{1,3}(?=$|[\s\.\-_])", re.IGNORECASE
+)
+# Standalone 4-digit year, used to tell a movie release from an anime episode.
+_MOVIE_YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 _ANIME_BRACKET_GROUP_RE = re.compile(r"^\[([^\]]+)\]", re.IGNORECASE)
 _ANIME_EPISODE_RES = tuple(
     re.compile(p, re.IGNORECASE)
@@ -744,13 +760,22 @@ _KNOWN_FANSUB_GROUPS = {
 _SANITIZE_SYMBOLS_RE = re.compile(r"[\.\-_:\s]+")
 _NON_ALNUM_RE = re.compile(r"[^\w\sÀ-ÿ]")
 
+# Newznab standard category tree. The subcategory ids are fixed by the spec
+# (2030/5030 = SD, 2040/5040 = HD, 2045/5045 = UHD); Prowlarr maps incoming
+# results by id and ignores the name we advertise in caps, so these must match
+# the spec exactly or every release is filed under the wrong quality tier.
 CATEGORY_MOVIES = 2000
-CATEGORY_MOVIES_HD = 2030
-CATEGORY_MOVIES_UHD = 2040
+CATEGORY_MOVIES_SD = 2030
+CATEGORY_MOVIES_HD = 2040
+CATEGORY_MOVIES_UHD = 2045
 CATEGORY_TV = 5000
-CATEGORY_TV_HD = 5030
-CATEGORY_TV_UHD = 5040
+CATEGORY_TV_SD = 5030
+CATEGORY_TV_HD = 5040
+CATEGORY_TV_UHD = 5045
 CATEGORY_ANIME = 5070
+# Declared in caps for completeness; _detect_category never falls back to it
+# because an unclassifiable release is far more likely to be a movie than to
+# be something Radarr should ignore.
 CATEGORY_OTHER = 7000
 
 
@@ -969,51 +994,82 @@ def _detect_anime(title: str) -> bool:
     if not bracket_match:
         return False
     group_name = bracket_match.group(1).strip().lower()
-    if group_name not in _KNOWN_FANSUB_GROUPS:
-        return False
     title_without_group = title[bracket_match.end():].strip()
-    return any(p.search(title_without_group) for p in _ANIME_EPISODE_RES)
+    if not any(p.search(title_without_group) for p in _ANIME_EPISODE_RES):
+        return False
+    if group_name in _KNOWN_FANSUB_GROUPS:
+        return True
+    # New or unlisted groups: the bracketed-group + episode-number shape is
+    # distinctive enough on its own, as long as the release doesn't carry a
+    # standalone year (which would make it look like a scene movie release).
+    return not _MOVIE_YEAR_RE.search(title_without_group)
 
 
-def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
+def _detect_category(
+    title: str,
+    metadata: Dict[str, Optional[Any]],
+    search_type: Optional[str] = None,
+) -> int:
+    """Map a release onto a Newznab category id.
+
+    ``search_type`` is the ``t=`` value of the request being served. Sonarr only
+    ever issues ``tvsearch`` and Radarr only ``movie``, so when the title itself
+    carries no usable marker the requesting app is the most reliable signal we
+    have. Getting this wrong is not cosmetic: Prowlarr filters results against
+    the categories the app asked for, so a mislabelled episode never reaches
+    Sonarr at all.
+    """
     if _detect_anime(title):
         return CATEGORY_ANIME
 
     season = metadata.get("season")
     episode = metadata.get("episode")
     quality = metadata.get("quality")
-    year = metadata.get("year")
 
     quality_lower = (quality or "").lower()
     is_uhd = False
     is_hd = False
+    is_sd = False
 
     if quality_lower:
         if "2160" in quality_lower or "4k" in quality_lower or "uhd" in quality_lower:
             is_uhd = True
         elif "720" in quality_lower or "1080" in quality_lower:
             is_hd = True
+        elif "480" in quality_lower or "576" in quality_lower or "sd" in quality_lower:
+            is_sd = True
 
     has_tv_pattern = season is not None or episode is not None
     if not has_tv_pattern:
-        if _SEASON_EP_RE.search(title):
-            has_tv_pattern = True
+        has_tv_pattern = any(
+            p.search(title)
+            for p in (
+                _SEASON_EP_RE,
+                _DATE_EPISODE_RE,
+                _VERBOSE_SEASON_RE,
+                _VERBOSE_EPISODE_RE,
+                _BARE_EPISODE_RE,
+            )
+        )
+    if not has_tv_pattern and search_type == "tvsearch":
+        has_tv_pattern = True
 
     if has_tv_pattern:
         if is_uhd:
             return CATEGORY_TV_UHD
-        elif is_hd:
+        if is_hd:
             return CATEGORY_TV_HD
-        else:
-            return CATEGORY_TV
+        if is_sd:
+            return CATEGORY_TV_SD
+        return CATEGORY_TV
 
-    if year or (not has_tv_pattern):
-        if is_uhd:
-            return CATEGORY_MOVIES_UHD
-        elif is_hd:
-            return CATEGORY_MOVIES_HD
-        else:
-            return CATEGORY_MOVIES
+    if is_uhd:
+        return CATEGORY_MOVIES_UHD
+    if is_hd:
+        return CATEGORY_MOVIES_HD
+    if is_sd:
+        return CATEGORY_MOVIES_SD
+    return CATEGORY_MOVIES
 
     return CATEGORY_MOVIES
 
@@ -1437,12 +1493,14 @@ def api():
             "</searching>"
             "<categories>"
             '<category id="2000" name="Movies">'
-            '<subcat id="2030" name="Movies/HD"/>'
-            '<subcat id="2040" name="Movies/UHD"/>'
+            '<subcat id="2030" name="Movies/SD"/>'
+            '<subcat id="2040" name="Movies/HD"/>'
+            '<subcat id="2045" name="Movies/UHD"/>'
             "</category>"
             '<category id="5000" name="TV">'
-            '<subcat id="5030" name="TV/HD"/>'
-            '<subcat id="5040" name="TV/UHD"/>'
+            '<subcat id="5030" name="TV/SD"/>'
+            '<subcat id="5040" name="TV/HD"/>'
+            '<subcat id="5045" name="TV/UHD"/>'
             '<subcat id="5070" name="TV/Anime"/>'
             "</category>"
             '<category id="7000" name="Other"/>'
@@ -1805,7 +1863,7 @@ def api():
                 "year": year,
                 "quality": quality,
             }
-            category_id = _detect_category(title_text, title_metadata)
+            category_id = _detect_category(title_text, title_metadata, search_type=t)
 
             attr_parts = [
                 f'<newznab:attr name="size" value="{size}"/>',
